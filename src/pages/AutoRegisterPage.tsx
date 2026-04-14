@@ -130,6 +130,19 @@ export function AutoRegisterPage() {
   const [customBrowserPath, setCustomBrowserPath] = useState('');
   const [showCustomBrowserInput, setShowCustomBrowserInput] = useState(false);
   
+  // 默认邮箱域名配置（从 localStorage 读取）
+  const [defaultEmailDomain, setDefaultEmailDomain] = useState(() => {
+    return localStorage.getItem('defaultEmailDomain') || 'annn.online';
+  });
+  
+  // 保存默认邮箱域名到 localStorage
+  const saveDefaultEmailDomain = (domain: string) => {
+    const cleanDomain = domain.trim().replace(/^@/, ''); // 移除开头的 @
+    setDefaultEmailDomain(cleanDomain);
+    localStorage.setItem('defaultEmailDomain', cleanDomain);
+    addLog(`默认邮箱域名已设置为: @${cleanDomain}`);
+  };
+  
   // 验证码输入相关状态
   const [verificationCode, setVerificationCode] = useState('');
   const [showCodeInput, setShowCodeInput] = useState(false);
@@ -268,7 +281,7 @@ export function AutoRegisterPage() {
     return parsed;
   };
 
-  // 生成随机邮箱（用于随机添加）
+  // 生成随机邮箱（使用配置的默认域名）
   const generateRandomEmail = (): string => {
     const letters = 'abcdefghijklmnopqrstuvwxyz';
     const alphanumeric = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -276,7 +289,7 @@ export function AutoRegisterPage() {
     for (let i = 0; i < 10; i++) {
       prefix += alphanumeric.charAt(Math.floor(Math.random() * alphanumeric.length));
     }
-    return prefix + '@annn.online';
+    return `${prefix}@${defaultEmailDomain}`;
   };
 
   const handleClear = () => {
@@ -564,38 +577,48 @@ export function AutoRegisterPage() {
                 ))}
               </select>
               
-              {/* Windsurf 平台时显示浏览器选择 */}
-              {selectedPlatform === 'windsurf' && (
-                <>
-                  <select
-                    value={selectedBrowser}
-                    onChange={(e) => {
-                      const value = e.target.value;
-                      setSelectedBrowser(value);
-                      setShowCustomBrowserInput(value === 'custom');
-                    }}
-                    className="browser-select"
-                    disabled={isRunning}
-                    title="选择浏览器"
-                  >
-                    {BROWSER_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                  
-                  {showCustomBrowserInput && (
-                    <input
-                      type="text"
-                      value={customBrowserPath}
-                      onChange={(e) => setCustomBrowserPath(e.target.value)}
-                      placeholder="输入浏览器可执行文件路径..."
-                      className="custom-browser-input"
-                      disabled={isRunning}
-                    />
-                  )}
-                </>
+              {/* 默认邮箱域名配置 */}
+              <div className="email-domain-config">
+                <span className="email-domain-label">@</span>
+                <input
+                  type="text"
+                  value={defaultEmailDomain}
+                  onChange={(e) => saveDefaultEmailDomain(e.target.value)}
+                  placeholder="邮箱域名"
+                  className="email-domain-input"
+                  disabled={isRunning}
+                  title="默认邮箱域名，自动生成邮箱时使用"
+                />
+              </div>
+              
+              {/* 浏览器选择 - 对所有平台开放 */}
+              <select
+                value={selectedBrowser}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setSelectedBrowser(value);
+                  setShowCustomBrowserInput(value === 'custom');
+                }}
+                className="browser-select"
+                disabled={isRunning}
+                title="选择浏览器"
+              >
+                {BROWSER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              
+              {showCustomBrowserInput && (
+                <input
+                  type="text"
+                  value={customBrowserPath}
+                  onChange={(e) => setCustomBrowserPath(e.target.value)}
+                  placeholder="输入浏览器可执行文件路径..."
+                  className="custom-browser-input"
+                  disabled={isRunning}
+                />
               )}
               
               <button
@@ -891,7 +914,7 @@ export function AutoRegisterPage() {
           <div className="help-content">
             <p>1. <strong>自动生成</strong>: 点击"开始注册"后系统自动生成随机邮箱并完成注册</p>
             <p>2. <strong>账号信息</strong>:</p>
-            <p className="help-indent">- 邮箱: 随机生成 @annn.online 邮箱</p>
+            <p className="help-indent">- 邮箱: 随机生成 @{defaultEmailDomain} 邮箱（可配置）</p>
             <p className="help-indent">- 密码: 统一使用 admin123456aA!</p>
             <p className="help-indent">- 姓名: 随机从常用英文名库中选择</p>
             <p>3. <strong>代理</strong>: 固定使用 http://127.0.0.1:7890</p>
