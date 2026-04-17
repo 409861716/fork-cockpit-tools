@@ -580,6 +580,36 @@ async function main() {
       result.success = true;
       result.name = fullName;
       result.error = '未能提取 SSO Token';
+      
+      // 延迟关闭浏览器，给用户 90 秒手动处理时间
+      log('\n⏳ 浏览器将保持打开 90 秒，供您手动处理...');
+      log('您可以在此期间手动完成注册流程，脚本会尝试再次提取 Token');
+      
+      // 等待 90 秒，期间每秒尝试重新提取一次
+      const waitSeconds = 90;
+      let tokenFound = false;
+      for (let i = 0; i < waitSeconds; i++) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // 每秒尝试提取一次
+        const retryToken = await extractSsoToken(page);
+        if (retryToken) {
+          result.ssoToken = retryToken;
+          result.error = null;
+          tokenFound = true;
+          log(`✓ 延迟期间成功获取 SSO Token！(${i + 1}秒后)`);
+          break;
+        }
+        
+        // 每 10 秒输出一次提示
+        if ((i + 1) % 10 === 0) {
+          log(`⏳ 已等待 ${i + 1} 秒，还剩 ${waitSeconds - i - 1} 秒...`);
+        }
+      }
+      
+      if (!tokenFound) {
+        log('\n⚠ 90 秒延迟结束，仍未获取到 SSO Token');
+      }
     }
     
   } catch (error) {

@@ -699,6 +699,7 @@ dependencies = [
  "chromiumoxide",
  "chrono",
  "dirs 5.0.1",
+ "dunce",
  "futures",
  "futures-util",
  "lazy_static",

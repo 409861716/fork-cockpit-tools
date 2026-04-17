@@ -35,29 +35,66 @@ pub async fn run_windsurf_oauth(
     let use_stealth = browser_path.as_ref().map(|b| b == "stealth").unwrap_or(false);
     
     let script_name = if use_stealth {
-        "auto_register_windsurf_stealth.js"
+        "auto_register_windsurf_stealth.cjs"
     } else {
-        "auto_register_windsurf.js"
+        "auto_register_windsurf.cjs"
     };
     
-    // 查找 Node.js 脚本路径（从多个可能位置查找）
-    let script_paths: Vec<PathBuf> = vec![
-        PathBuf::from(format!("scripts/{}", script_name)),
-        PathBuf::from(format!("../scripts/{}", script_name)),
-        PathBuf::from(format!("../../scripts/{}", script_name)),
-    ];
-
-    let script_path: PathBuf = script_paths.into_iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            let err = format!("未找到 {} 脚本", script_name);
-            log_error(&err);
-            anyhow!(err)
-        })?;
+    // 查找 Node.js 脚本路径（优先从 Tauri 资源目录查找，但需确保有 node_modules）
+    let script_path: PathBuf = if let Ok(resource_dir) = app.path().resource_dir() {
+        let resource_script = resource_dir.join("scripts").join(&script_name);
+        let resource_node_modules = resource_dir.join("scripts/node_modules");
+        // 资源目录的脚本必须配套 node_modules 才使用
+        if resource_script.exists() && resource_node_modules.exists() {
+            log_info("使用资源目录脚本");
+            resource_script
+        } else if resource_script.exists() {
+            log_info("资源目录脚本缺少 node_modules，回退到开发路径");
+            // 回退到开发环境路径
+            let dev_paths: Vec<PathBuf> = vec![
+                PathBuf::from("scripts").join(&script_name),
+                PathBuf::from("..").join("scripts").join(&script_name),
+                PathBuf::from("..").join("..").join("scripts").join(&script_name),
+            ];
+            dev_paths.into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    let err = format!("未找到带 node_modules 的 {} 脚本", script_name);
+                    log_error(&err);
+                    anyhow!(err)
+                })?
+        } else {
+            // 回退到开发环境路径
+            let dev_paths: Vec<PathBuf> = vec![
+                PathBuf::from("scripts").join(&script_name),
+                PathBuf::from("..").join("scripts").join(&script_name),
+                PathBuf::from("..").join("..").join("scripts").join(&script_name),
+            ];
+            dev_paths.into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    let err = format!("未找到 {} 脚本", script_name);
+                    log_error(&err);
+                    anyhow!(err)
+                })?
+        }
+    } else {
+        // 回退到开发环境路径
+        let dev_paths: Vec<PathBuf> = vec![
+            PathBuf::from("scripts").join(&script_name),
+            PathBuf::from("..").join("scripts").join(&script_name),
+            PathBuf::from("..").join("..").join("scripts").join(&script_name),
+        ];
+        dev_paths.into_iter()
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                let err = format!("未找到 {} 脚本", script_name);
+                log_error(&err);
+                anyhow!(err)
+            })?
+    };
 
     log_info(&format!("脚本路径: {:?}", script_path));
-
-    let scripts_dir = script_path.parent().unwrap().to_path_buf();
 
     let mut args = vec![];
 
@@ -101,27 +138,35 @@ pub async fn run_windsurf_oauth(
 
     log_info("启动 Windsurf OAuth 授权浏览器...");
 
+    // 将 UNC 路径转换为标准路径（解决 Windows UNC 路径问题）
+    let script_path_str = dunce::simplified(&script_path).to_string_lossy().to_string();
+    log_info(&format!("标准化脚本路径: {}", script_path_str));
+
     // 执行 Node.js 脚本
     let mut child = tokio::process::Command::new("node")
-        .arg(&script_path)
+        .arg(&script_path_str)
         .args(&args)
-        .current_dir(&scripts_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow!("启动 Node.js 进程失败: {}", e))?;
 
-    // 获取 stderr 用于实时日志流
+    // 获取 stderr 用于实时日志流和错误收集
     let stderr = child.stderr.take().ok_or_else(|| anyhow!("无法获取 stderr"))?;
     let app_clone = app.clone();
 
-    // 启动异步任务读取日志
+    // 启动异步任务读取日志和错误
     let log_task = tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
+        let mut stderr_output = String::new();
 
         while let Ok(Some(line)) = lines.next_line().await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+
+            // 发送 [LOG] 前缀的日志到前端
             if line.starts_with("[LOG] ") {
                 let message = line.trim_start_matches("[LOG] ");
                 let _ = app_clone.emit(
@@ -133,6 +178,8 @@ pub async fn run_windsurf_oauth(
                 );
             }
         }
+
+        stderr_output
     });
 
     // 获取 stdout 用于读取结果
@@ -151,8 +198,9 @@ pub async fn run_windsurf_oauth(
     });
 
     // 等待任务完成
-    let (stdout_result, _) = tokio::join!(stdout_task, log_task);
+    let (stdout_result, stderr_result) = tokio::join!(stdout_task, log_task);
     let output = stdout_result.map_err(|e| anyhow!("读取 stdout 失败: {}", e))?;
+    let stderr_output = stderr_result.unwrap_or_default();
 
     // 等待进程结束
     let status = child
@@ -162,9 +210,18 @@ pub async fn run_windsurf_oauth(
 
     log_info(&format!("Node.js 进程退出码: {:?}", status.code()));
 
+    // 如果进程失败且有 stderr 输出，记录错误信息
+    if !status.success() && !stderr_output.is_empty() {
+        log_error(&format!("脚本 stderr 输出:\n{}", stderr_output));
+    }
+
     // 解析结果
     if output.trim().is_empty() {
-        return Err(anyhow!("脚本输出为空"));
+        if stderr_output.trim().is_empty() {
+            return Err(anyhow!("脚本输出为空"));
+        } else {
+            return Err(anyhow!("脚本执行失败: {}", stderr_output.trim()));
+        }
     }
 
     match serde_json::from_str::<WindsurfRegisterResult>(&output) {

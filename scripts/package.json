@@ -7,7 +7,6 @@
     "install-chrome": "npx playwright install chromium"
   },
   "dependencies": {
-    "playwright": "^1.41.0",
-    "puppeteer-stealth": "^2.11.2"
+    "playwright": "^1.41.0"
   }
 }

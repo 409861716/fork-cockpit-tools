@@ -497,27 +497,249 @@ async fn extract_sso_token(page: &Page) -> Result<String> {
     Err(anyhow!("未能获取 SSO Token (x-amz-sso_authn cookie)"))
 }
 
-/// 使用 SSO Token 创建账号
-/// AWS Builder ID 的 SSO Token 需要经过 Kiro OAuth 流程才能使用
-/// 这里我们直接创建账号，token 将在首次使用时由 Kiro 客户端处理
+/// SSO 设备授权结果
+#[derive(Debug, Clone)]
+struct SsoAuthResult {
+    access_token: String,
+    refresh_token: String,
+    client_id: String,
+    client_secret: String,
+    region: String,
+    expires_in: i64,
+}
+
+/// 使用 SSO Token 执行完整的 AWS SSO 设备授权流程
+/// 获取有效的 access_token 和 refresh_token
 pub async fn exchange_sso_token(bearer_token: &str, email: &str, name: &str) -> Result<ImportedAccountData> {
-    // 生成用户 ID (使用 email 的哈希)
-    let user_id = format!("aws-builder-id-{}", email.replace(|c: char| !c.is_alphanumeric(), "-"));
-    
-    // 注意：AWS SSO Token 不能直接用于 Kiro API
-    // 我们将其作为初始 token 存储，Kiro 客户端会在首次使用时处理 OAuth 流程
-    Ok(ImportedAccountData {
-        email: email.to_string(),
-        user_id,
-        access_token: bearer_token.to_string(),
-        refresh_token: String::new(),
-        client_id: String::new(),
-        client_secret: String::new(),
-        region: "us-east-1".to_string(),
-        expires_in: 3600,
-        idp: "AWS".to_string(),
-        subscription_type: "builder-id".to_string(),
-        subscription_title: "AWS Builder ID".to_string(),
-        usage: json!({}),
-    })
+    let region = "us-east-1";
+    let oidc_base = format!("https://oidc.{region}.amazonaws.com");
+    let portal_base = "https://portal.sso.us-east-1.amazonaws.com";
+    let start_url = "https://view.awsapps.com/start";
+    let scopes = vec![
+        "codewhisperer:analysis",
+        "codewhisperer:completions",
+        "codewhisperer:conversations",
+        "codewhisperer:taskassist",
+        "codewhisperer:transformations",
+    ];
+
+    // Step 1: 注册 OIDC 客户端
+    println!("[SSO] Step 1: Registering OIDC client...");
+    let client = reqwest::Client::new();
+    let reg_res = client
+        .post(format!("{}/client/register", oidc_base))
+        .json(&serde_json::json!({
+            "clientName": "Kiro Account Manager",
+            "clientType": "public",
+            "scopes": scopes,
+            "grantTypes": ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
+            "issuerUrl": start_url
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("注册客户端请求失败: {}", e))?;
+
+    if !reg_res.status().is_success() {
+        let status = reg_res.status();
+        let text = reg_res.text().await.unwrap_or_default();
+        return Err(anyhow!("注册客户端失败: {} - {}", status, text));
+    }
+
+    let reg_data: serde_json::Value = reg_res.json().await?;
+    let client_id = reg_data["clientId"].as_str().ok_or_else(|| anyhow!("响应中缺少 clientId"))?.to_string();
+    let client_secret = reg_data["clientSecret"].as_str().ok_or_else(|| anyhow!("响应中缺少 clientSecret"))?.to_string();
+    println!("[SSO] Client registered: {}...", &client_id[..client_id.len().min(30)]);
+
+    // Step 2: 发起设备授权
+    println!("[SSO] Step 2: Starting device authorization...");
+    let dev_res = client
+        .post(format!("{}/device_authorization", oidc_base))
+        .json(&serde_json::json!({
+            "clientId": &client_id,
+            "clientSecret": &client_secret,
+            "startUrl": start_url
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("设备授权请求失败: {}", e))?;
+
+    if !dev_res.status().is_success() {
+        let status = dev_res.status();
+        let text = dev_res.text().await.unwrap_or_default();
+        return Err(anyhow!("设备授权失败: {} - {}", status, text));
+    }
+
+    let dev_data: serde_json::Value = dev_res.json().await?;
+    let device_code = dev_data["deviceCode"].as_str().ok_or_else(|| anyhow!("响应中缺少 deviceCode"))?.to_string();
+    let _user_code = dev_data["userCode"].as_str().ok_or_else(|| anyhow!("响应中缺少 userCode"))?.to_string();
+    let interval = dev_data["interval"].as_i64().unwrap_or(1) as u64;
+    println!("[SSO] Device code obtained, user_code: {}", _user_code);
+
+    // Step 3: 验证 Bearer Token (whoAmI)
+    println!("[SSO] Step 3: Verifying bearer token...");
+    let who_res = client
+        .get(format!("{}/token/whoAmI", portal_base))
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| anyhow!("whoAmI 请求失败: {}", e))?;
+
+    if !who_res.status().is_success() {
+        let status = who_res.status();
+        let text = who_res.text().await.unwrap_or_default();
+        return Err(anyhow!("Token 验证失败: {} - {}", status, text));
+    }
+    println!("[SSO] Bearer token verified");
+
+    // Step 4: 获取设备会话令牌
+    println!("[SSO] Step 4: Getting device session token...");
+    let sess_res = client
+        .post(format!("{}/session/device", portal_base))
+        .header("Authorization", format!("Bearer {}", bearer_token))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| anyhow!("获取设备会话请求失败: {}", e))?;
+
+    if !sess_res.status().is_success() {
+        let status = sess_res.status();
+        let text = sess_res.text().await.unwrap_or_default();
+        return Err(anyhow!("获取设备会话失败: {} - {}", status, text));
+    }
+
+    let sess_data: serde_json::Value = sess_res.json().await?;
+    let device_session_token = sess_data["token"].as_str().ok_or_else(|| anyhow!("响应中缺少 session token"))?.to_string();
+    println!("[SSO] Device session token obtained");
+
+    // Step 5: 接受用户代码
+    println!("[SSO] Step 5: Accepting user code...");
+    let accept_res = client
+        .post(format!("{}/device_authorization/accept_user_code", oidc_base))
+        .header("Content-Type", "application/json")
+        .header("Referer", "https://view.awsapps.com/")
+        .json(&serde_json::json!({
+            "userCode": _user_code,
+            "userSessionId": &device_session_token
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow!("接受用户代码请求失败: {}", e))?;
+
+    if !accept_res.status().is_success() {
+        let status = accept_res.status();
+        let text = accept_res.text().await.unwrap_or_default();
+        return Err(anyhow!("接受用户代码失败: {} - {}", status, text));
+    }
+
+    let accept_data: serde_json::Value = accept_res.json().await?;
+    let device_context = accept_data["deviceContext"].as_object();
+    println!("[SSO] User code accepted");
+
+    // Step 6: 批准授权
+    if let Some(ctx) = device_context {
+        if let Some(device_context_id) = ctx.get("deviceContextId").and_then(|v| v.as_str()) {
+            println!("[SSO] Step 6: Approving authorization...");
+            let client_id_in_ctx = ctx.get("clientId").and_then(|v| v.as_str()).unwrap_or(&client_id);
+            let client_type = ctx.get("clientType").and_then(|v| v.as_str()).unwrap_or("public");
+
+            let approve_res = client
+                .post(format!("{}/device_authorization/associate_token", oidc_base))
+                .header("Content-Type", "application/json")
+                .header("Referer", "https://view.awsapps.com/")
+                .json(&serde_json::json!({
+                    "deviceContext": {
+                        "deviceContextId": device_context_id,
+                        "clientId": client_id_in_ctx,
+                        "clientType": client_type
+                    },
+                    "userSessionId": &device_session_token
+                }))
+                .send()
+                .await
+                .map_err(|e| anyhow!("批准授权请求失败: {}", e))?;
+
+            if !approve_res.status().is_success() {
+                let status = approve_res.status();
+                let text = approve_res.text().await.unwrap_or_default();
+                return Err(anyhow!("批准授权失败: {} - {}", status, text));
+            }
+            println!("[SSO] Authorization approved");
+        }
+    }
+
+    // Step 7: 轮询获取 Token
+    println!("[SSO] Step 7: Polling for token...");
+    let start_time = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(120); // 2 分钟超时
+    let mut current_interval = interval;
+
+    while start_time.elapsed() < timeout {
+        tokio::time::sleep(tokio::time::Duration::from_secs(current_interval)).await;
+
+        let token_res = client
+            .post(format!("{}/token", oidc_base))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "clientId": &client_id,
+                "clientSecret": &client_secret,
+                "grantType": "urn:ietf:params:oauth:grant-type:device_code",
+                "deviceCode": &device_code
+            }))
+            .send()
+            .await;
+
+        match token_res {
+            Ok(res) if res.status().is_success() => {
+                let token_data: serde_json::Value = res.json().await?;
+                let access_token = token_data["accessToken"].as_str().ok_or_else(|| anyhow!("响应中缺少 accessToken"))?.to_string();
+                let refresh_token = token_data["refreshToken"].as_str().ok_or_else(|| anyhow!("响应中缺少 refreshToken"))?.to_string();
+                let expires_in = token_data["expiresIn"].as_i64().unwrap_or(3600);
+
+                println!("[SSO] Token obtained successfully!");
+
+                // 生成用户 ID
+                let user_id = format!("aws-builder-id-{}", email.replace(|c: char| !c.is_alphanumeric(), "-"));
+
+                return Ok(ImportedAccountData {
+                    email: email.to_string(),
+                    user_id,
+                    access_token,
+                    refresh_token,
+                    client_id,
+                    client_secret,
+                    region: region.to_string(),
+                    expires_in,
+                    idp: "BuilderId".to_string(),
+                    subscription_type: "builder-id".to_string(),
+                    subscription_title: "AWS Builder ID".to_string(),
+                    usage: json!({}),
+                });
+            }
+            Ok(res) if res.status().as_u16() == 400 => {
+                let err_data: serde_json::Value = res.json().await?;
+                let error = err_data["error"].as_str().unwrap_or("unknown");
+
+                match error {
+                    "authorization_pending" => {
+                        // 继续轮询
+                        continue;
+                    }
+                    "slow_down" => {
+                        current_interval += 5;
+                    }
+                    _ => {
+                        return Err(anyhow!("Token 获取失败: {}", error));
+                    }
+                }
+            }
+            Err(e) => {
+                println!("[SSO] Token poll error: {}", e);
+            }
+            _ => {}
+        }
+    }
+
+    Err(anyhow!("授权超时，请重试"))
 }

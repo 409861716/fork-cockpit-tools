@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use serde::{Deserialize, Serialize};
 
 /// 自动注册参数
@@ -75,11 +75,13 @@ pub async fn auto_register_kiro(
     use std::process::Stdio;
     use tokio::process::Command;
     
-    let full_name = format!("{} {}", params.first_name, params.last_name);
-    
+
+    // Clone app for the closure (AppHandle is cheap to clone)
+    let app_for_log = app.clone();
+
     // 发送日志回调函数
-    let send_log = |email: &str, message: &str| {
-        let _ = app.emit("auto-register-log", serde_json::json!({
+    let send_log = move |email: &str, message: &str| {
+        let _ = app_for_log.emit("auto-register-log", serde_json::json!({
             "email": email,
             "message": message,
         }));
@@ -87,20 +89,60 @@ pub async fn auto_register_kiro(
     
     send_log(&params.email, "启动 Node.js 自动注册脚本...");
     
-    // 查找 Node.js 脚本路径（从多个可能位置查找）
-    let script_paths: Vec<PathBuf> = vec![
-        PathBuf::from("scripts/auto_register_kiro.js"),
-        PathBuf::from("../scripts/auto_register_kiro.js"),
-        PathBuf::from("../../scripts/auto_register_kiro.js"),
-    ];
-    
-    let script_path: PathBuf = script_paths.into_iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| {
-            let err = "未找到 auto_register_kiro.js 脚本".to_string();
-            send_log(&params.email, &err);
-            err
-        })?;
+    // 查找 Node.js 脚本路径（优先从 Tauri 资源目录查找，但需确保有 node_modules）
+    let script_name = "auto_register_kiro.cjs";
+    let script_path: PathBuf = if let Ok(resource_dir) = app.path().resource_dir() {
+        let resource_script = resource_dir.join("scripts").join(script_name);
+        let resource_node_modules = resource_dir.join("scripts/node_modules");
+        // 资源目录的脚本必须配套 node_modules 才使用
+        if resource_script.exists() && resource_node_modules.exists() {
+            send_log(&params.email, "使用资源目录脚本");
+            resource_script
+        } else if resource_script.exists() {
+            send_log(&params.email, "资源目录脚本缺少 node_modules，回退到开发路径");
+            // 回退到开发环境路径
+            let dev_paths: Vec<PathBuf> = vec![
+                PathBuf::from("scripts").join(script_name),
+                PathBuf::from("..").join("scripts").join(script_name),
+                PathBuf::from("..").join("..").join("scripts").join(script_name),
+            ];
+            dev_paths.into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    let err = "未找到带 node_modules 的 auto_register_kiro.cjs 脚本".to_string();
+                    send_log(&params.email, &err);
+                    err
+                })?
+        } else {
+            // 回退到开发环境路径
+            let dev_paths: Vec<PathBuf> = vec![
+                PathBuf::from("scripts").join(script_name),
+                PathBuf::from("..").join("scripts").join(script_name),
+                PathBuf::from("..").join("..").join("scripts").join(script_name),
+            ];
+            dev_paths.into_iter()
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    let err = "未找到 auto_register_kiro.cjs 脚本".to_string();
+                    send_log(&params.email, &err);
+                    err
+                })?
+        }
+    } else {
+        // 回退到开发环境路径
+        let dev_paths: Vec<PathBuf> = vec![
+            PathBuf::from("scripts").join(script_name),
+            PathBuf::from("..").join("scripts").join(script_name),
+            PathBuf::from("..").join("..").join("scripts").join(script_name),
+        ];
+        dev_paths.into_iter()
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                let err = "未找到 auto_register_kiro.cjs 脚本".to_string();
+                send_log(&params.email, &err);
+                err
+            })?
+    };
     
     send_log(&params.email, &format!("脚本路径: {:?}", script_path));
     
@@ -153,9 +195,13 @@ pub async fn auto_register_kiro(
     
     send_log(&params.email, "启动 Playwright 浏览器...");
     
+    // 将 UNC 路径转换为标准路径（解决 Windows UNC 路径问题）
+    let script_path_str = dunce::simplified(&script_path).to_string_lossy().to_string();
+    send_log(&params.email, &format!("标准化脚本路径: {}", script_path_str));
+    
     // 执行 Node.js 脚本
     let mut child = Command::new("node")
-        .arg(&script_path)
+        .arg(&script_path_str)
         .args(&args)
         .current_dir(&scripts_dir)
         .stdout(Stdio::piped())
