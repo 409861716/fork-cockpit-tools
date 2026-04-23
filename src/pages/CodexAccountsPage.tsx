@@ -2153,17 +2153,27 @@ export function CodexAccountsPage() {
     [localAccessCollection?.accountIds],
   );
 
-  const handleSaveLocalAccessAccounts = useCallback(async (accountIds: string[]) => {
+  const handleSaveLocalAccessAccounts = useCallback(async (
+    accountIds: string[],
+    options?: { restrictFreeAccounts?: boolean },
+  ) => {
     setLocalAccessSaving(true);
     try {
+      const restrictFreeAccounts = options?.restrictFreeAccounts ?? true;
       const accountById = new Map(accounts.map((account) => [account.id, account]));
       const filteredAccountIds = accountIds.filter((accountId) => {
         const account = accountById.get(accountId);
         if (!account) return false;
         if (isCodexApiKeyAccount(account)) return false;
-        return !isCodexExplicitFreePlanType(account.plan_type);
+        if (restrictFreeAccounts && isCodexExplicitFreePlanType(account.plan_type)) {
+          return false;
+        }
+        return true;
       });
-      const nextState = await codexLocalAccessService.saveCodexLocalAccessAccounts(filteredAccountIds);
+      const nextState = await codexLocalAccessService.saveCodexLocalAccessAccounts(
+        filteredAccountIds,
+        restrictFreeAccounts,
+      );
       setLocalAccessState(nextState);
       setMessage({
         text: t('codex.localAccess.saveSuccess', 'API 服务集合已更新'),
@@ -2182,6 +2192,9 @@ export function CodexAccountsPage() {
     try {
       await handleSaveLocalAccessAccounts(
         localAccessCollection.accountIds.filter((id) => id !== accountId),
+        {
+          restrictFreeAccounts: localAccessCollection.restrictFreeAccounts ?? true,
+        },
       );
     } catch (error) {
       setMessage({
@@ -2509,6 +2522,21 @@ export function CodexAccountsPage() {
   const handleActivateLocalAccess = useCallback(async () => {
     if (!localAccessCollection) {
       throw new Error(t('codex.localAccess.testUnavailable', '当前 API 服务地址不可用'));
+    }
+    if (!localAccessCollection.enabled) {
+      const confirmedEnableAndSwitch = await confirmDialog(
+        t(
+          'codex.localAccess.enableBeforeActivateMessage',
+          'API 服务当前未启用，需要先启用服务。是否启用并切号？',
+        ),
+        {
+          title: t('codex.localAccess.enableBeforeActivateTitle', '服务未启用'),
+          kind: 'warning',
+          okLabel: t('codex.localAccess.enableAndActivateAction', '启用并切号'),
+          cancelLabel: t('common.cancel', '取消'),
+        },
+      );
+      if (!confirmedEnableAndSwitch) return;
     }
     const confirmed = await requestLocalAccessRiskNotice('service');
     if (!confirmed) return;
@@ -4753,7 +4781,9 @@ export function CodexAccountsPage() {
           initialSelectedIds={localAccessModalSelectedIds}
           maskAccountText={maskAccountText}
           onClose={() => setShowLocalAccessModal(false)}
-          onSaveAccounts={({ accountIds }) => handleSaveLocalAccessAccounts(accountIds)}
+          onSaveAccounts={({ accountIds, restrictFreeAccounts }) =>
+            handleSaveLocalAccessAccounts(accountIds, { restrictFreeAccounts })
+          }
           onClearStats={handleClearLocalAccessStats}
           onRefreshStats={reloadLocalAccessState}
           onUpdatePort={handleUpdateLocalAccessPort}

@@ -185,9 +185,10 @@ type AppPathMissingDetail = {
     | { kind: 'switchAccount'; accountId?: string };
 };
 
-  const WAKEUP_ENABLED_KEY = 'agtools.wakeup.enabled';
+const WAKEUP_ENABLED_KEY = 'agtools.wakeup.enabled';
 const TASKS_STORAGE_KEY = 'agtools.wakeup.tasks';
 const WAKEUP_FORCE_DISABLE_MIGRATION_KEY = 'agtools.wakeup.migration.force_disable_0_8_14';
+const TOP_RIGHT_AD_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
 type WakeupHistoryRecord = {
   id: string;
@@ -495,10 +496,22 @@ function MainApp() {
     setShowBreakout(true);
   }, []);
   const handleExternalProviderImportRawPayload = useCallback((rawPayload: unknown) => {
+    console.info('[ExternalImport][App] 收到原始 payload:', rawPayload)
     const normalized = normalizeExternalProviderImportPayload(rawPayload);
-    if (!normalized) return;
+    if (!normalized) {
+      console.warn('[ExternalImport][App] payload 归一化失败，已忽略');
+      return;
+    }
+    console.info('[ExternalImport][App] payload 归一化成功:', {
+      providerId: normalized.providerId,
+      page: normalized.page,
+      autoImport: normalized.autoImport,
+      tokenLength: normalized.token.length,
+      source: normalized.source ?? null,
+    });
     setPage(normalized.page);
     window.setTimeout(() => {
+      console.info('[ExternalImport][App] 分发前端外部导入事件');
       dispatchExternalProviderImportEvent(normalized);
     }, 0);
   }, []);
@@ -558,6 +571,15 @@ function MainApp() {
 
   useEffect(() => {
     void fetchTopRightAdState();
+  }, [fetchTopRightAdState]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void fetchTopRightAdState();
+    }, TOP_RIGHT_AD_REFRESH_INTERVAL_MS);
+    return () => {
+      window.clearInterval(intervalId);
+    };
   }, [fetchTopRightAdState]);
 
   useEffect(() => {
@@ -2575,6 +2597,7 @@ function MainApp() {
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     listen('external:provider-import', (event) => {
+      console.info('[ExternalImport][App] 收到 Tauri 事件 external:provider-import');
       handleExternalProviderImportRawPayload(event.payload);
     }).then((fn) => {
       unlisten = fn;
@@ -2591,7 +2614,12 @@ function MainApp() {
     let canceled = false;
     void invoke<unknown>('external_import_take_pending')
       .then((payload) => {
-        if (canceled || !payload) return;
+        if (canceled) return;
+        if (!payload) {
+          console.info('[ExternalImport][App] 启动时无待处理导入 payload');
+          return;
+        }
+        console.info('[ExternalImport][App] 启动时读取到待处理导入 payload');
         handleExternalProviderImportRawPayload(payload);
       })
       .catch((error) => {
