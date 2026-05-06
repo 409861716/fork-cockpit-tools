@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+fn default_token_source_mode() -> String {
+    "managed".to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Codex 认证模式
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -59,6 +67,8 @@ pub struct CodexAccount {
     pub user_id: Option<String>,
     pub plan_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_active_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_file_plan_type: Option<String>,
     pub account_id: Option<String>,
     pub organization_id: Option<String>,
@@ -67,6 +77,16 @@ pub struct CodexAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_structure: Option<String>,
     pub tokens: CodexTokens,
+    #[serde(default)]
+    pub token_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_updated_at: Option<i64>,
+    #[serde(default = "default_token_source_mode")]
+    pub token_source_mode: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_reauth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth_reason: Option<String>,
     pub quota: Option<CodexQuota>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_error: Option<CodexQuotaErrorInfo>,
@@ -169,6 +189,8 @@ pub struct CodexAccountSummary {
     pub id: String,
     pub email: String,
     pub plan_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_active_until: Option<String>,
     pub created_at: i64,
     pub last_used: i64,
 }
@@ -192,6 +214,7 @@ impl Default for CodexAccountIndex {
 /// JWT Payload 中的用户信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexJwtPayload {
+    #[serde(default)]
     pub aud: serde_json::Value, // 可能是 string 或 array
     pub iss: Option<String>,
     pub email: Option<String>,
@@ -201,6 +224,15 @@ pub struct CodexJwtPayload {
     pub sub: Option<String>,
     #[serde(rename = "https://api.openai.com/auth")]
     pub auth_data: Option<CodexAuthData>,
+    #[serde(rename = "https://api.openai.com/profile")]
+    pub profile_data: Option<CodexProfileData>,
+}
+
+/// JWT 中的 profile 数据
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexProfileData {
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
 }
 
 /// JWT 中的 auth 数据
@@ -208,6 +240,7 @@ pub struct CodexJwtPayload {
 pub struct CodexAuthData {
     pub chatgpt_user_id: Option<String>,
     pub chatgpt_plan_type: Option<String>,
+    pub chatgpt_subscription_active_until: Option<serde_json::Value>,
     pub account_id: Option<String>,
     pub organization_id: Option<String>,
 }
@@ -226,12 +259,18 @@ impl CodexAccount {
             api_provider_name: None,
             user_id: None,
             plan_type: None,
+            subscription_active_until: None,
             auth_file_plan_type: None,
             account_id: None,
             organization_id: None,
             account_name: None,
             account_structure: None,
             tokens,
+            token_generation: 0,
+            token_updated_at: Some(now),
+            token_source_mode: default_token_source_mode(),
+            requires_reauth: false,
+            reauth_reason: None,
             quota: None,
             quota_error: None,
             usage_updated_at: None,

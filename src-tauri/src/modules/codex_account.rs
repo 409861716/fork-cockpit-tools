@@ -6,16 +6,20 @@ use crate::modules::{account, codex_oauth, logger};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use toml_edit::{value, Document};
 
 static CODEX_QUOTA_ALERT_LAST_SENT: std::sync::LazyLock<Mutex<HashMap<String, i64>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static CODEX_TOKEN_REFRESH_LOCKS: std::sync::LazyLock<
+    Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static CODEX_AUTO_SWITCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const CODEX_QUOTA_ALERT_COOLDOWN_SECONDS: i64 = 300;
 const ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
@@ -34,10 +38,26 @@ const CODEX_PROVIDER_WIRE_API: &str = "responses";
 const CODEX_CONTEXT_WINDOW_1M_VALUE: i64 = 1_000_000;
 const CODEX_AUTO_COMPACT_DEFAULT_LIMIT: i64 = 900_000;
 #[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const CODEX_AUTO_SWITCH_ACCOUNT_SCOPE_ALL: &str = "all_accounts";
 const CODEX_AUTO_SWITCH_ACCOUNT_SCOPE_SELECTED: &str = "selected_accounts";
 const DISK_FULL_ERROR_CODE: &str = "DISK_FULL";
+const CODEX_TOKEN_SOURCE_MANAGED: &str = "managed";
+const CODEX_PROACTIVE_REFRESH_INTERVAL_SECONDS: i64 = 8 * 24 * 60 * 60;
+const CODEX_AUTH_PROJECTION_FILE_NAME: &str = ".cockpit_codex_auth.json";
+const CODEX_AUTH_PROJECTION_WRITER: &str = "cockpit";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CodexManagedAuthProjection {
+    version: u32,
+    writer: String,
+    account_id: String,
+    email: String,
+    token_generation: u64,
+    written_at: i64,
+}
 
 fn is_auth_mode_apikey(value: Option<&str>) -> bool {
     matches!(
@@ -275,6 +295,7 @@ fn apply_api_key_fields(
         refresh_token: None,
     };
     account.user_id = None;
+    account.subscription_active_until = None;
     account.account_id = None;
     account.organization_id = None;
     account.account_structure = None;
@@ -306,6 +327,26 @@ fn extract_api_base_url_from_json_value(value: &serde_json::Value) -> Option<Str
 
 fn normalize_optional_json_str(value: Option<&serde_json::Value>) -> Option<String> {
     normalize_optional_ref(value.and_then(|item| item.as_str()))
+}
+
+fn normalize_optional_json_scalar(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|item| {
+        if let Some(raw) = item.as_str() {
+            return normalize_optional_ref(Some(raw));
+        }
+        if let Some(raw) = item.as_i64() {
+            return Some(raw.to_string());
+        }
+        if let Some(raw) = item.as_u64() {
+            return Some(raw.to_string());
+        }
+        if let Some(raw) = item.as_f64() {
+            if raw.is_finite() {
+                return Some(raw.trunc().to_string());
+            }
+        }
+        None
+    })
 }
 
 fn extract_account_record_field(
@@ -625,7 +666,8 @@ fn write_quick_config_to_config_toml(
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建 config.toml 目录失败: {}", e))?;
     }
-    fs::write(&config_path, doc.to_string())
+    let content = doc.to_string();
+    crate::modules::atomic_write::write_string_atomic(&config_path, &content)
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
 
     read_quick_config_from_config_toml(base_dir)
@@ -783,7 +825,9 @@ fn write_api_provider_to_config_toml(
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建 config.toml 目录失败: {}", e))?;
     }
-    fs::write(&config_path, doc.to_string()).map_err(|e| format!("写入 config.toml 失败: {}", e))
+    let content = doc.to_string();
+    crate::modules::atomic_write::write_string_atomic(&config_path, &content)
+        .map_err(|e| format!("写入 config.toml 失败: {}", e))
 }
 
 /// 旧版数据目录（~/Library/Application Support/com.antigravity.cockpit-tools/）
@@ -937,11 +981,130 @@ fn normalize_optional_ref(value: Option<&str>) -> Option<String> {
     })
 }
 
-fn should_force_refresh_token(message: &str) -> bool {
+fn now_timestamp() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn codex_token_lock_for(account_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = CODEX_TOKEN_REFRESH_LOCKS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn mark_token_chain_updated(account: &mut CodexAccount) {
+    account.token_generation = account.token_generation.saturating_add(1);
+    account.token_updated_at = Some(now_timestamp());
+    account.token_source_mode = CODEX_TOKEN_SOURCE_MANAGED.to_string();
+    account.requires_reauth = false;
+    account.reauth_reason = None;
+}
+
+fn sync_identity_from_tokens(account: &mut CodexAccount) {
+    if let Ok((
+        email,
+        user_id,
+        plan_type,
+        subscription_active_until,
+        id_token_account_id,
+        id_token_org_id,
+    )) = extract_user_info(&account.tokens.id_token)
+    {
+        if !email.trim().is_empty() {
+            account.email = email;
+        }
+        account.user_id = user_id;
+        account.plan_type = plan_type;
+        account.subscription_active_until = subscription_active_until;
+        account.account_id = normalize_optional_value(
+            extract_chatgpt_account_id_from_access_token(&account.tokens.access_token)
+                .or(id_token_account_id)
+                .or_else(|| account.account_id.clone()),
+        );
+        account.organization_id = normalize_optional_value(
+            extract_chatgpt_organization_id_from_access_token(&account.tokens.access_token)
+                .or(id_token_org_id)
+                .or_else(|| account.organization_id.clone()),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexRefreshErrorKind {
+    RefreshTokenReused,
+    RefreshTokenExpired,
+    RefreshTokenInvalidated,
+    InvalidGrant,
+    UnsupportedCountryRegion,
+    Other,
+}
+
+fn classify_refresh_error(message: &str) -> CodexRefreshErrorKind {
     let lower = message.to_ascii_lowercase();
-    lower.contains("token_invalidated")
-        || lower.contains("your authentication token has been invalidated")
-        || lower.contains("401 unauthorized")
+    if lower.contains("unsupported_country_region_territory") {
+        return CodexRefreshErrorKind::UnsupportedCountryRegion;
+    }
+    if lower.contains("refresh_token_reused") {
+        return CodexRefreshErrorKind::RefreshTokenReused;
+    }
+    if lower.contains("refresh_token_expired") {
+        return CodexRefreshErrorKind::RefreshTokenExpired;
+    }
+    if lower.contains("refresh_token_invalidated")
+        || lower.contains("token_invalidated")
+        || lower.contains("authentication token has been invalidated")
+    {
+        return CodexRefreshErrorKind::RefreshTokenInvalidated;
+    }
+    if lower.contains("invalid_grant") || lower.contains("invalid refresh token") {
+        return CodexRefreshErrorKind::InvalidGrant;
+    }
+    CodexRefreshErrorKind::Other
+}
+
+fn is_reauth_required_refresh_error(message: &str) -> bool {
+    matches!(
+        classify_refresh_error(message),
+        CodexRefreshErrorKind::RefreshTokenReused
+            | CodexRefreshErrorKind::RefreshTokenExpired
+            | CodexRefreshErrorKind::RefreshTokenInvalidated
+            | CodexRefreshErrorKind::InvalidGrant
+    )
+}
+
+fn format_refresh_error_for_user(raw: &str) -> String {
+    match classify_refresh_error(raw) {
+        CodexRefreshErrorKind::RefreshTokenReused => format!(
+            "Codex 授权已失效：refresh_token 已被其它客户端或实例使用过。Codex 的 refresh_token 是轮换凭据，旧凭据再次刷新会被服务端拒绝。请重新登录，并避免官方 Codex、其它实例或外部工具同时刷新同一账号。原始错误: {}",
+            raw
+        ),
+        CodexRefreshErrorKind::RefreshTokenExpired => format!(
+            "Codex 登录授权已过期，无法自动刷新。请重新登录 Codex 账号。原始错误: {}",
+            raw
+        ),
+        CodexRefreshErrorKind::RefreshTokenInvalidated => format!(
+            "Codex 登录授权已被服务端撤销，无法自动刷新。请重新登录 Codex 账号。原始错误: {}",
+            raw
+        ),
+        CodexRefreshErrorKind::InvalidGrant => format!(
+            "Codex 登录授权无效，无法自动刷新。请重新登录 Codex 账号。原始错误: {}",
+            raw
+        ),
+        CodexRefreshErrorKind::UnsupportedCountryRegion => format!(
+            "当前网络地区不支持刷新 Codex 授权。OpenAI 授权服务拒绝了当前网络出口的刷新请求，请切换到支持的网络地区后重试。原始错误: {}",
+            raw
+        ),
+        CodexRefreshErrorKind::Other => format!("Token 已过期且刷新失败: {}", raw),
+    }
+}
+
+fn mark_account_requires_reauth(account: &mut CodexAccount, reason: &str) -> Result<(), String> {
+    account.requires_reauth = true;
+    account.reauth_reason = Some(reason.to_string());
+    save_account(account)
 }
 
 pub fn extract_chatgpt_account_id_from_access_token(access_token: &str) -> Option<String> {
@@ -1039,12 +1202,21 @@ pub fn extract_user_info(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     ),
     String,
 > {
     let payload = decode_jwt_payload(id_token)?;
 
-    let email = payload.email.ok_or("id_token 中缺少 email")?;
+    let email = payload
+        .email
+        .or_else(|| {
+            payload
+                .profile_data
+                .as_ref()
+                .and_then(|data| data.email.clone())
+        })
+        .ok_or("id_token 中缺少 email")?;
     let user_id = payload
         .auth_data
         .as_ref()
@@ -1053,6 +1225,10 @@ pub fn extract_user_info(
         .auth_data
         .as_ref()
         .and_then(|d| d.chatgpt_plan_type.clone());
+    let subscription_active_until = payload
+        .auth_data
+        .as_ref()
+        .and_then(|d| normalize_optional_json_scalar(d.chatgpt_subscription_active_until.as_ref()));
     let account_id = payload
         .auth_data
         .as_ref()
@@ -1062,7 +1238,14 @@ pub fn extract_user_info(
         .as_ref()
         .and_then(|d| d.organization_id.clone());
 
-    Ok((email, user_id, plan_type, account_id, organization_id))
+    Ok((
+        email,
+        user_id,
+        plan_type,
+        subscription_active_until,
+        account_id,
+        organization_id,
+    ))
 }
 
 /// 读取账号索引
@@ -1252,6 +1435,7 @@ fn repair_account_index_from_details(reason: &str) -> Option<CodexAccountIndex> 
             id: account.id.clone(),
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_active_until: account.subscription_active_until.clone(),
             created_at: account.created_at,
             last_used: account.last_used,
         })
@@ -1296,17 +1480,179 @@ fn repair_account_index_from_details(reason: &str) -> Option<CodexAccountIndex> 
     Some(index)
 }
 
-/// 读取单个账号详情
-pub fn load_account(account_id: &str) -> Option<CodexAccount> {
-    let path = get_accounts_dir().join(format!("{}.json", account_id));
-    if !path.exists() {
-        return None;
+fn read_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let raw = keys
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|item| item.as_str()))?;
+    normalize_optional_ref(Some(raw))
+}
+
+fn read_json_i64(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        let item = value.get(*key)?;
+        if item.is_string() {
+            return parse_auth_file_last_refresh(Some(item));
+        }
+        item.as_i64()
+            .or_else(|| item.as_u64().and_then(|raw| i64::try_from(raw).ok()))
+    })
+}
+
+fn read_codex_api_provider_mode(value: &serde_json::Value) -> Option<CodexApiProviderMode> {
+    value
+        .get("api_provider_mode")
+        .or_else(|| value.get("apiProviderMode"))
+        .and_then(|item| serde_json::from_value::<CodexApiProviderMode>(item.clone()).ok())
+}
+
+fn apply_compat_account_metadata(
+    account: &mut CodexAccount,
+    value: &serde_json::Value,
+    summary: Option<&CodexAccountSummary>,
+) {
+    let now = now_timestamp();
+    if account.email.trim().is_empty() {
+        account.email = read_json_string(value, &["email", "account_email"])
+            .or_else(|| summary.map(|item| item.email.clone()))
+            .unwrap_or_else(|| account.id.clone());
+    }
+    account.account_name = read_json_string(value, &["account_name", "accountName"])
+        .or_else(|| account.account_name.clone());
+    account.account_structure = read_json_string(value, &["account_structure", "accountStructure"])
+        .or_else(|| account.account_structure.clone());
+    account.auth_file_plan_type =
+        read_json_string(value, &["auth_file_plan_type", "authFilePlanType"])
+            .or_else(|| account.auth_file_plan_type.clone());
+    account.plan_type = read_json_string(value, &["plan_type", "planType"])
+        .or_else(|| account.plan_type.clone())
+        .or_else(|| summary.and_then(|item| item.plan_type.clone()));
+    account.subscription_active_until = read_json_string(
+        value,
+        &["subscription_active_until", "subscriptionActiveUntil"],
+    )
+    .or_else(|| account.subscription_active_until.clone())
+    .or_else(|| summary.and_then(|item| item.subscription_active_until.clone()));
+    account.created_at = read_json_i64(value, &["created_at", "createdAt"])
+        .or_else(|| summary.map(|item| item.created_at))
+        .unwrap_or(now);
+    account.last_used = read_json_i64(value, &["last_used", "lastUsed"])
+        .or_else(|| summary.map(|item| item.last_used))
+        .unwrap_or(account.created_at);
+    account.token_updated_at = read_json_i64(value, &["token_updated_at", "tokenUpdatedAt"])
+        .or_else(|| parse_auth_file_last_refresh(value.get("last_refresh")))
+        .or(account.token_updated_at);
+}
+
+fn parse_codex_account_compat(
+    value: serde_json::Value,
+    fallback_id: &str,
+    summary: Option<&CodexAccountSummary>,
+) -> Result<Option<CodexAccount>, String> {
+    if let Ok(mut account) = serde_json::from_value::<CodexAccount>(value.clone()) {
+        if account.id.trim().is_empty() {
+            account.id = fallback_id.to_string();
+        }
+        apply_compat_account_metadata(&mut account, &value, summary);
+        return Ok(Some(account));
     }
 
-    match fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).ok(),
-        Err(_) => None,
+    if is_auth_mode_apikey(
+        value
+            .get("auth_mode")
+            .and_then(|item| item.as_str())
+            .or_else(|| value.get("authMode").and_then(|item| item.as_str())),
+    ) {
+        let Some(api_key) = value
+            .get("OPENAI_API_KEY")
+            .and_then(|item| item.as_str())
+            .and_then(normalize_api_key)
+        else {
+            return Ok(None);
+        };
+        let api_base_url_hint = extract_api_base_url_from_json_value(&value);
+        let (api_key, api_base_url) =
+            validate_api_key_credentials(&api_key, api_base_url_hint.as_deref())?;
+        let provider_config = resolve_api_provider_config(
+            api_base_url.as_deref(),
+            read_codex_api_provider_mode(&value),
+            value.get("api_provider_id").and_then(|item| item.as_str()),
+            value
+                .get("api_provider_name")
+                .and_then(|item| item.as_str()),
+        )?;
+        let mut account = CodexAccount::new_api_key(
+            fallback_id.to_string(),
+            read_json_string(&value, &["email", "account_email"])
+                .or_else(|| summary.map(|item| item.email.clone()))
+                .unwrap_or_else(|| build_api_key_email(&api_key)),
+            api_key,
+            provider_config.mode,
+            provider_config.base_url,
+            provider_config.provider_id,
+            provider_config.provider_name,
+        );
+        apply_compat_account_metadata(&mut account, &value, summary);
+        account.plan_type = Some(API_KEY_LOGIN_PLAN_TYPE.to_string());
+        return Ok(Some(account));
     }
+
+    let Some((tokens, account_id_hint)) = extract_codex_tokens_from_value(&value) else {
+        return Ok(None);
+    };
+    let mut account = CodexAccount::new(
+        fallback_id.to_string(),
+        read_json_string(&value, &["email", "account_email"])
+            .or_else(|| summary.map(|item| item.email.clone()))
+            .unwrap_or_else(|| fallback_id.to_string()),
+        tokens,
+    );
+    account.account_id = normalize_optional_value(
+        extract_chatgpt_account_id_from_access_token(&account.tokens.access_token)
+            .or(account_id_hint)
+            .or_else(|| read_json_string(&value, &["account_id", "accountId"])),
+    );
+    account.organization_id = normalize_optional_value(read_json_string(
+        &value,
+        &["organization_id", "organizationId"],
+    ));
+    sync_identity_from_tokens(&mut account);
+    apply_compat_account_metadata(&mut account, &value, summary);
+    Ok(Some(account))
+}
+
+/// 读取单个账号详情
+pub fn load_account(account_id: &str) -> Option<CodexAccount> {
+    load_account_with_summary(account_id, None).ok().flatten()
+}
+
+fn load_account_with_summary(
+    account_id: &str,
+    summary: Option<&CodexAccountSummary>,
+) -> Result<Option<CodexAccount>, String> {
+    let path = get_accounts_dir().join(format!("{}.json", account_id));
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("读取账号详情失败 ({}): {}", path.display(), error))?;
+    if let Ok(account) = serde_json::from_str::<CodexAccount>(&content) {
+        return Ok(Some(account));
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| format!("账号详情不是有效 JSON ({}): {}", path.display(), error))?;
+    let account = parse_codex_account_compat(value, account_id, summary)?
+        .ok_or_else(|| format!("账号详情缺少可识别凭据 ({})", path.display()))?;
+
+    if let Err(error) = save_account(&account) {
+        logger::log_warn(&format!(
+            "[Codex Account][Compat] 账号详情兼容读取成功但标准化写回失败: account_id={}, error={}",
+            account.id, error
+        ));
+    }
+
+    Ok(Some(account))
 }
 
 /// 保存单个账号详情
@@ -1333,17 +1679,51 @@ pub fn list_accounts() -> Vec<CodexAccount> {
     index
         .accounts
         .iter()
-        .filter_map(|summary| load_account(&summary.id))
+        .filter_map(
+            |summary| match load_account_with_summary(&summary.id, Some(summary)) {
+                Ok(account) => account,
+                Err(error) => {
+                    logger::log_warn(&format!(
+                        "[Codex Account] 跳过无法读取的账号详情: account_id={}, error={}",
+                        summary.id, error
+                    ));
+                    None
+                }
+            },
+        )
         .collect()
 }
 
 pub fn list_accounts_checked() -> Result<Vec<CodexAccount>, String> {
     let index = load_account_index_checked()?;
-    Ok(index
-        .accounts
-        .iter()
-        .filter_map(|summary| load_account(&summary.id))
-        .collect())
+    let mut accounts = Vec::new();
+    let mut failed = Vec::new();
+
+    for summary in &index.accounts {
+        match load_account_with_summary(&summary.id, Some(summary)) {
+            Ok(Some(account)) => accounts.push(account),
+            Ok(None) => failed.push(format!("{}: 详情文件不存在", summary.id)),
+            Err(error) => failed.push(format!("{}: {}", summary.id, error)),
+        }
+    }
+
+    if !index.accounts.is_empty() && accounts.is_empty() {
+        return Err(format!(
+            "Codex 账号索引中有 {} 个账号，但详情文件均无法读取；已保留前端缓存，请从账号备份或本地账号文件恢复。{}",
+            index.accounts.len(),
+            failed.join("; ")
+        ));
+    }
+
+    if !failed.is_empty() {
+        logger::log_warn(&format!(
+            "[Codex Account] 部分账号详情无法读取，已保留可读取账号: loaded={}, failed={}",
+            accounts.len(),
+            failed.join("; ")
+        ));
+    }
+
+    Ok(accounts)
 }
 
 /// 刷新账号资料（团队名/结构）
@@ -1354,28 +1734,7 @@ async fn refresh_account_profile_once(account_id: &str) -> Result<CodexAccount, 
     }
 
     let (account_name, account_structure, account_id_from_remote) =
-        match fetch_remote_account_profile(&account).await {
-            Ok(profile) => profile,
-            Err(err) if should_force_refresh_token(&err) => {
-                let refresh_token = account.tokens.refresh_token.clone().ok_or(err.clone())?;
-
-                logger::log_warn(&format!(
-                    "Codex 账号资料请求检测到失效 Token，准备强制刷新后重试: account={}, error={}",
-                    account.email, err
-                ));
-
-                account.tokens = codex_oauth::refresh_access_token_with_fallback(
-                    &refresh_token,
-                    Some(account.tokens.id_token.as_str()),
-                )
-                .await
-                .map_err(|e| format!("账号资料接口返回 Token 失效，刷新 Token 失败: {}", e))?;
-                save_account(&account)?;
-
-                fetch_remote_account_profile(&account).await?
-            }
-            Err(err) => return Err(err),
-        };
+        fetch_remote_account_profile(&account).await?;
 
     let mut changed = false;
 
@@ -1409,12 +1768,7 @@ async fn refresh_account_profile_once(account_id: &str) -> Result<CodexAccount, 
 }
 
 pub async fn refresh_account_profile(account_id: &str) -> Result<CodexAccount, String> {
-    crate::modules::refresh_retry::retry_once_with_delay(
-        "Codex Profile Refresh",
-        account_id,
-        || async { refresh_account_profile_once(account_id).await },
-    )
-    .await
+    refresh_account_profile_once(account_id).await
 }
 
 /// 添加或更新账号
@@ -1474,6 +1828,7 @@ pub fn upsert_api_key_account(
             id: account_id.clone(),
             email: acc.email.clone(),
             plan_type: acc.plan_type.clone(),
+            subscription_active_until: acc.subscription_active_until.clone(),
             created_at: acc.created_at,
             last_used: acc.last_used,
         });
@@ -1486,12 +1841,14 @@ pub fn upsert_api_key_account(
     if let Some(summary) = index.accounts.iter_mut().find(|item| item.id == account.id) {
         summary.email = account.email.clone();
         summary.plan_type = account.plan_type.clone();
+        summary.subscription_active_until = account.subscription_active_until.clone();
         summary.last_used = account.last_used;
     } else {
         index.accounts.push(CodexAccountSummary {
             id: account.id.clone(),
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_active_until: account.subscription_active_until.clone(),
             created_at: account.created_at,
             last_used: account.last_used,
         });
@@ -1513,8 +1870,14 @@ fn upsert_account_with_hints(
     account_id_hint: Option<String>,
     organization_id_hint: Option<String>,
 ) -> Result<CodexAccount, String> {
-    let (email, user_id, plan_type, id_token_account_id, id_token_org_id) =
-        extract_user_info(&tokens.id_token)?;
+    let (
+        email,
+        user_id,
+        plan_type,
+        subscription_active_until,
+        id_token_account_id,
+        id_token_org_id,
+    ) = extract_user_info(&tokens.id_token)?;
     let account_id = normalize_optional_value(
         extract_chatgpt_account_id_from_access_token(&tokens.access_token)
             .or(id_token_account_id)
@@ -1546,6 +1909,7 @@ fn upsert_account_with_hints(
         let mut acc = load_account(&existing_id)
             .unwrap_or_else(|| CodexAccount::new(existing_id, email.clone(), tokens.clone()));
         acc.tokens = tokens;
+        mark_token_chain_updated(&mut acc);
         acc.auth_mode = CodexAuthMode::OAuth;
         acc.openai_api_key = None;
         acc.api_base_url = None;
@@ -1554,6 +1918,7 @@ fn upsert_account_with_hints(
         acc.api_provider_name = None;
         acc.user_id = user_id;
         acc.plan_type = plan_type.clone();
+        acc.subscription_active_until = subscription_active_until.clone();
         acc.account_id = account_id.clone();
         acc.organization_id = organization_id.clone();
         acc.update_last_used();
@@ -1561,6 +1926,7 @@ fn upsert_account_with_hints(
     } else {
         // 创建新账号
         let mut acc = CodexAccount::new(existing_id.clone(), email.clone(), tokens);
+        mark_token_chain_updated(&mut acc);
         acc.auth_mode = CodexAuthMode::OAuth;
         acc.openai_api_key = None;
         acc.api_base_url = None;
@@ -1569,6 +1935,7 @@ fn upsert_account_with_hints(
         acc.api_provider_name = None;
         acc.user_id = user_id;
         acc.plan_type = plan_type.clone();
+        acc.subscription_active_until = subscription_active_until.clone();
         acc.account_id = account_id.clone();
         acc.organization_id = organization_id.clone();
 
@@ -1577,6 +1944,7 @@ fn upsert_account_with_hints(
             id: existing_id.clone(),
             email: email.clone(),
             plan_type: plan_type.clone(),
+            subscription_active_until: subscription_active_until.clone(),
             created_at: acc.created_at,
             last_used: acc.last_used,
         });
@@ -1590,12 +1958,14 @@ fn upsert_account_with_hints(
     if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account.id) {
         summary.email = account.email.clone();
         summary.plan_type = account.plan_type.clone();
+        summary.subscription_active_until = account.subscription_active_until.clone();
         summary.last_used = account.last_used;
     } else {
         index.accounts.push(CodexAccountSummary {
             id: account.id.clone(),
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_active_until: account.subscription_active_until.clone(),
             created_at: account.created_at,
             last_used: account.last_used,
         });
@@ -1615,10 +1985,12 @@ fn upsert_account_with_hints(
 pub fn update_account_plan_type_in_index(
     account_id: &str,
     plan_type: &Option<String>,
+    subscription_active_until: &Option<String>,
 ) -> Result<(), String> {
     let mut index = load_account_index();
     if let Some(summary) = index.accounts.iter_mut().find(|a| a.id == account_id) {
         summary.plan_type = plan_type.clone();
+        summary.subscription_active_until = subscription_active_until.clone();
         save_account_index(&index)?;
     }
     Ok(())
@@ -1654,12 +2026,50 @@ pub fn remove_accounts(account_ids: &[String]) -> Result<(), String> {
 struct LocalCodexOAuthSnapshot {
     tokens: CodexTokens,
     email: String,
+    subscription_active_until: Option<String>,
     account_id: Option<String>,
     organization_id: Option<String>,
+    last_refresh_at: Option<i64>,
+}
+
+fn parse_auth_file_last_refresh(value: Option<&serde_json::Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(raw) = value.as_i64() {
+        return Some(if raw > 1_000_000_000_000 {
+            raw / 1000
+        } else {
+            raw
+        });
+    }
+    if let Some(raw) = value.as_u64() {
+        let normalized = if raw > 1_000_000_000_000 {
+            raw / 1000
+        } else {
+            raw
+        };
+        return i64::try_from(normalized).ok();
+    }
+
+    let raw = value.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.timestamp());
+    }
+    if let Ok(parsed) = raw.parse::<i64>() {
+        return Some(if parsed > 1_000_000_000_000 {
+            parsed / 1000
+        } else {
+            parsed
+        });
+    }
+
+    None
 }
 
 fn build_local_oauth_snapshot(tokens: CodexAuthTokens) -> Option<LocalCodexOAuthSnapshot> {
-    let (email, _, _, id_token_account_id, id_token_org_id) =
+    let (email, _, _, subscription_active_until, id_token_account_id, id_token_org_id) =
         extract_user_info(&tokens.id_token).ok()?;
     let account_id = normalize_optional_value(
         tokens
@@ -1679,24 +2089,135 @@ fn build_local_oauth_snapshot(tokens: CodexAuthTokens) -> Option<LocalCodexOAuth
             refresh_token: tokens.refresh_token,
         },
         email,
+        subscription_active_until,
         account_id,
         organization_id,
+        last_refresh_at: None,
     })
 }
 
-fn load_local_oauth_snapshot_from_dir(base_dir: &Path) -> Option<LocalCodexOAuthSnapshot> {
+fn read_codex_auth_file_from_dir(base_dir: &Path) -> Option<CodexAuthFile> {
     let auth_path = base_dir.join("auth.json");
     if !auth_path.exists() {
         return None;
     }
 
     let content = fs::read_to_string(&auth_path).ok()?;
-    let auth_file: CodexAuthFile = serde_json::from_str(&content).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn load_local_oauth_snapshot_from_auth_file(
+    auth_file: CodexAuthFile,
+) -> Option<LocalCodexOAuthSnapshot> {
     if is_auth_mode_apikey(auth_file.auth_mode.as_deref()) {
         return None;
     }
 
-    build_local_oauth_snapshot(auth_file.tokens?)
+    let last_refresh_at = parse_auth_file_last_refresh(auth_file.last_refresh.as_ref());
+    let mut snapshot = build_local_oauth_snapshot(auth_file.tokens?)?;
+    snapshot.last_refresh_at = last_refresh_at;
+    Some(snapshot)
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn is_codex_keychain_item_not_found(status: std::process::ExitStatus, stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    status.code() == Some(44)
+        || lower.contains("could not be found")
+        || lower.contains("errsecitemnotfound")
+        || lower.contains("specified item could not be found")
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn read_codex_keychain_auth_file_from_dir(
+    base_dir: &Path,
+) -> Result<Option<CodexAuthFile>, String> {
+    let keychain_account = build_codex_keychain_account(base_dir);
+    let output = std::process::Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(CODEX_KEYCHAIN_SERVICE)
+        .arg("-a")
+        .arg(&keychain_account)
+        .arg("-w")
+        .output()
+        .map_err(|e| format!("执行 security 命令失败: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_codex_keychain_item_not_found(output.status, &stderr) {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "读取 Codex keychain 失败: status={}, stderr={}, stdout={}",
+            output.status,
+            if stderr.trim().is_empty() {
+                "<empty>"
+            } else {
+                stderr.trim()
+            },
+            if stdout.trim().is_empty() {
+                "<empty>"
+            } else {
+                stdout.trim()
+            }
+        ));
+    }
+
+    let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if secret.is_empty() {
+        return Ok(None);
+    }
+
+    let auth_file: CodexAuthFile = serde_json::from_str(&secret)
+        .map_err(|e| format!("解析 Codex keychain JSON 失败: {}", e))?;
+    Ok(Some(auth_file))
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn read_codex_keychain_auth_file_from_dir(
+    _base_dir: &Path,
+) -> Result<Option<CodexAuthFile>, String> {
+    Ok(None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_codex_keychain_auth_file_from_dir(
+    _base_dir: &Path,
+) -> Result<Option<CodexAuthFile>, String> {
+    Ok(None)
+}
+
+fn load_local_oauth_snapshot_from_official_store(
+    base_dir: &Path,
+) -> Option<LocalCodexOAuthSnapshot> {
+    let auth_json = read_codex_auth_file_from_dir(base_dir);
+    if auth_json
+        .as_ref()
+        .map(|auth_file| is_auth_mode_apikey(auth_file.auth_mode.as_deref()))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    match read_codex_keychain_auth_file_from_dir(base_dir) {
+        Ok(Some(auth_file)) => {
+            if let Some(snapshot) = load_local_oauth_snapshot_from_auth_file(auth_file) {
+                return Some(snapshot);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            logger::log_warn(&format!(
+                "读取 Codex 官方 keychain 凭证失败，回退读取 auth.json: target_dir={}, error={}",
+                base_dir.display(),
+                err
+            ));
+        }
+    }
+
+    auth_json.and_then(load_local_oauth_snapshot_from_auth_file)
 }
 
 fn local_oauth_snapshot_matches_account(
@@ -1738,21 +2259,25 @@ fn apply_local_oauth_snapshot(
     snapshot: &LocalCodexOAuthSnapshot,
 ) -> bool {
     let mut changed = false;
+    let mut token_changed = false;
 
     if account.tokens.id_token != snapshot.tokens.id_token {
         account.tokens.id_token = snapshot.tokens.id_token.clone();
         changed = true;
+        token_changed = true;
     }
 
     if account.tokens.access_token != snapshot.tokens.access_token {
         account.tokens.access_token = snapshot.tokens.access_token.clone();
         changed = true;
+        token_changed = true;
     }
 
     if let Some(refresh_token) = normalize_optional_ref(snapshot.tokens.refresh_token.as_deref()) {
         if account.tokens.refresh_token.as_deref() != Some(refresh_token.as_str()) {
             account.tokens.refresh_token = Some(refresh_token);
             changed = true;
+            token_changed = true;
         }
     }
 
@@ -1766,14 +2291,105 @@ fn apply_local_oauth_snapshot(
         changed = true;
     }
 
+    if normalize_optional_ref(account.subscription_active_until.as_deref())
+        != snapshot.subscription_active_until
+    {
+        account.subscription_active_until = snapshot.subscription_active_until.clone();
+        changed = true;
+    }
+
+    if token_changed {
+        mark_token_chain_updated(account);
+    }
+
     changed
+}
+
+fn local_oauth_snapshot_has_token_delta(
+    account: &CodexAccount,
+    snapshot: &LocalCodexOAuthSnapshot,
+) -> bool {
+    account.tokens.id_token != snapshot.tokens.id_token
+        || account.tokens.access_token != snapshot.tokens.access_token
+        || normalize_optional_ref(account.tokens.refresh_token.as_deref())
+            != normalize_optional_ref(snapshot.tokens.refresh_token.as_deref())
+}
+
+fn should_accept_authority_snapshot(
+    account: &CodexAccount,
+    snapshot: &LocalCodexOAuthSnapshot,
+) -> bool {
+    if !local_oauth_snapshot_has_token_delta(account, snapshot) {
+        return false;
+    }
+
+    let account_updated_at = account.token_updated_at.unwrap_or(0);
+    if snapshot
+        .last_refresh_at
+        .map(|value| value >= account_updated_at)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    codex_oauth::is_token_expired(&account.tokens.access_token)
+        && !codex_oauth::is_token_expired(&snapshot.tokens.access_token)
+}
+
+fn sync_account_from_authority_dir_if_current(
+    account: &mut CodexAccount,
+    base_dir: &Path,
+) -> Result<bool, String> {
+    let Some(snapshot) = load_local_oauth_snapshot_from_official_store(base_dir) else {
+        return Ok(false);
+    };
+
+    if !local_oauth_snapshot_matches_account(&snapshot, account) {
+        return Ok(false);
+    }
+
+    if !should_accept_authority_snapshot(account, &snapshot) {
+        return Ok(false);
+    }
+
+    if apply_local_oauth_snapshot(account, &snapshot) {
+        save_account(account)?;
+        logger::log_info(&format!(
+            "Codex 账号刷新前已采用更近的官方凭证: account_id={}, source_dir={}, last_refresh_at={}",
+            account.id,
+            base_dir.display(),
+            snapshot
+                .last_refresh_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn sync_account_from_authority_sources(account: &mut CodexAccount) -> Result<bool, String> {
+    let mut dirs = vec![get_codex_home()];
+    dirs.extend(managed_projection_dirs_for_account(&account.id));
+
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.to_string_lossy().to_string()));
+
+    let mut changed = false;
+    for dir in dirs {
+        if sync_account_from_authority_dir_if_current(account, &dir)? {
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn sync_account_from_auth_dir_if_current(
     account: &mut CodexAccount,
     base_dir: &Path,
 ) -> Result<bool, String> {
-    let Some(snapshot) = load_local_oauth_snapshot_from_dir(base_dir) else {
+    let Some(snapshot) = load_local_oauth_snapshot_from_official_store(base_dir) else {
         return Ok(false);
     };
 
@@ -1784,7 +2400,7 @@ fn sync_account_from_auth_dir_if_current(
     if apply_local_oauth_snapshot(account, &snapshot) {
         save_account(account)?;
         logger::log_info(&format!(
-            "Codex 账号已从本地 auth.json 同步最新 Token: account_id={}, source_dir={}",
+            "Codex 账号已从官方凭证源同步最新 Token: account_id={}, source_dir={}",
             account.id,
             base_dir.display()
         ));
@@ -1793,6 +2409,37 @@ fn sync_account_from_auth_dir_if_current(
     Ok(true)
 }
 
+/// 显式导入/同步入口：只在用户主动选择从官方目录回读时使用，业务主路径禁止自动调用。
+pub fn sync_current_official_account_from_dir(
+    base_dir: &Path,
+) -> Result<Option<CodexAccount>, String> {
+    let Some(snapshot) = load_local_oauth_snapshot_from_official_store(base_dir) else {
+        return Ok(None);
+    };
+
+    for mut account in list_accounts() {
+        if account.is_api_key_auth() {
+            continue;
+        }
+        if !local_oauth_snapshot_matches_account(&snapshot, &account) {
+            continue;
+        }
+
+        if apply_local_oauth_snapshot(&mut account, &snapshot) {
+            save_account(&account)?;
+            logger::log_info(&format!(
+                "Codex 当前官方凭证已同步回账号库: account_id={}, source_dir={}",
+                account.id,
+                base_dir.display()
+            ));
+        }
+        return Ok(Some(account));
+    }
+
+    Ok(None)
+}
+
+/// 显式导入/同步入口：只在用户主动选择从指定目录回读时使用，业务主路径禁止自动调用。
 pub fn sync_account_from_auth_dir(
     account_id: &str,
     base_dir: &Path,
@@ -1804,6 +2451,52 @@ pub fn sync_account_from_auth_dir(
     }
 
     let _ = sync_account_from_auth_dir_if_current(&mut account, base_dir)?;
+    Ok(account)
+}
+
+pub fn sync_managed_projection_from_auth_dir(
+    account_id: &str,
+    base_dir: &Path,
+) -> Result<CodexAccount, String> {
+    let projection = read_managed_projection_from_dir(base_dir)
+        .ok_or_else(|| "目标目录不是 Cockpit 受管 Codex 投影，已拒绝反向同步".to_string())?;
+    if projection.account_id != account_id {
+        return Err(format!(
+            "受管投影账号不匹配: expected={}, actual={}",
+            account_id, projection.account_id
+        ));
+    }
+
+    let mut account =
+        load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    if account.is_api_key_auth() {
+        return Ok(account);
+    }
+    if account.token_generation != projection.token_generation {
+        return Err(format!(
+            "受管投影版本已过期，跳过反向同步: account_id={}, store_generation={}, projection_generation={}",
+            account_id, account.token_generation, projection.token_generation
+        ));
+    }
+
+    let snapshot = load_local_oauth_snapshot_from_official_store(base_dir)
+        .ok_or_else(|| "受管投影缺少可同步的 OAuth Token".to_string())?;
+    if !local_oauth_snapshot_matches_account(&snapshot, &account) {
+        return Err("受管投影 Token 与账号不匹配，已拒绝反向同步".to_string());
+    }
+
+    if apply_local_oauth_snapshot(&mut account, &snapshot) {
+        save_account(&account)?;
+        write_prepared_account_bundle_to_dir(base_dir, &account)?;
+        write_managed_account_projections(&account);
+        logger::log_info(&format!(
+            "Codex 受管投影已同步回账号库: account_id={}, generation={}, source_dir={}",
+            account.id,
+            account.token_generation,
+            base_dir.display()
+        ));
+    }
+
     Ok(account)
 }
 
@@ -1866,9 +2559,9 @@ fn sync_api_key_account_from_local_state(account: &mut CodexAccount, base_dir: &
 pub fn get_current_account() -> Option<CodexAccount> {
     let current_id = load_account_index().current_account_id?;
     let mut account = load_account(&current_id)?;
+    let base_dir = get_codex_home();
 
     if account.is_api_key_auth() {
-        let base_dir = get_codex_home();
         sync_api_key_account_from_local_state(&mut account, &base_dir);
     }
     Some(account)
@@ -1907,7 +2600,7 @@ fn build_auth_file_value(account: &CodexAccount) -> Result<serde_json::Value, St
     .map_err(|e| format!("auth.json 序列化失败: {}", e))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn build_codex_keychain_account(base_dir: &Path) -> String {
     let resolved_home = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
     let mut hasher = Sha256::new();
@@ -1917,7 +2610,7 @@ fn build_codex_keychain_account(base_dir: &Path) -> String {
     format!("cli|{}", &digest_hex[..16])
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn write_codex_keychain_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
     if account.is_api_key_auth() {
         return Ok(());
@@ -1963,6 +2656,11 @@ fn write_codex_keychain_to_dir(base_dir: &Path, account: &CodexAccount) -> Resul
         "[Codex切号] 已更新 keychain 登录信息: service={}, account={}",
         CODEX_KEYCHAIN_SERVICE, keychain_account
     ));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", test))]
+fn write_codex_keychain_to_dir(_base_dir: &Path, _account: &CodexAccount) -> Result<(), String> {
     Ok(())
 }
 
@@ -2017,16 +2715,41 @@ fn build_temp_file_path(parent: &Path, target: &Path, suffix: &str) -> PathBuf {
 }
 
 fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
-    let parent = path.parent().ok_or("无法定位目标目录")?;
-    fs::create_dir_all(parent).map_err(|e| format_io_error("创建目录", parent, &e))?;
-    let temp_path = build_temp_file_path(parent, path, "atomic");
-    fs::write(&temp_path, content).map_err(|e| format_io_error("写入临时文件", &temp_path, &e))?;
-    if let Err(err) = fs::rename(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(format_io_error("替换文件", path, &err));
-    }
+    crate::modules::atomic_write::write_string_atomic(path, content)
+}
 
-    Ok(())
+fn build_managed_projection(account: &CodexAccount) -> CodexManagedAuthProjection {
+    CodexManagedAuthProjection {
+        version: 1,
+        writer: CODEX_AUTH_PROJECTION_WRITER.to_string(),
+        account_id: account.id.clone(),
+        email: account.email.clone(),
+        token_generation: account.token_generation,
+        written_at: now_timestamp(),
+    }
+}
+
+fn projection_path_for_dir(base_dir: &Path) -> PathBuf {
+    base_dir.join(CODEX_AUTH_PROJECTION_FILE_NAME)
+}
+
+fn write_managed_projection_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
+    let projection = build_managed_projection(account);
+    let content = serde_json::to_string_pretty(&projection)
+        .map_err(|e| format!("受管投影序列化失败: {}", e))?;
+    write_string_atomic(&projection_path_for_dir(base_dir), &content)
+        .map_err(|e| format!("写入受管投影失败: {}", e))
+}
+
+fn read_managed_projection_from_dir(base_dir: &Path) -> Option<CodexManagedAuthProjection> {
+    let path = projection_path_for_dir(base_dir);
+    let content = fs::read_to_string(path).ok()?;
+    let projection: CodexManagedAuthProjection = serde_json::from_str(&content).ok()?;
+    if projection.writer == CODEX_AUTH_PROJECTION_WRITER {
+        Some(projection)
+    } else {
+        None
+    }
 }
 
 fn ensure_directory_writable_for_import(path: &Path) -> Result<(), String> {
@@ -2104,7 +2827,18 @@ pub fn write_auth_file_to_dir(base_dir: &Path, account: &CodexAccount) -> Result
     Ok(())
 }
 
-pub fn write_account_bundle_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
+fn resolve_account_for_bundle_write(
+    base_dir: &Path,
+    account: &CodexAccount,
+) -> Result<CodexAccount, String> {
+    let _ = base_dir;
+    Ok(account.clone())
+}
+
+pub(crate) fn write_prepared_account_bundle_to_dir(
+    base_dir: &Path,
+    account: &CodexAccount,
+) -> Result<(), String> {
     write_auth_file_to_dir(base_dir, account)?;
     if let Err(err) = write_codex_keychain_to_dir(base_dir, account) {
         logger::log_warn(&format!(
@@ -2112,67 +2846,237 @@ pub fn write_account_bundle_to_dir(base_dir: &Path, account: &CodexAccount) -> R
             err
         ));
     }
+    write_managed_projection_to_dir(base_dir, account)?;
     Ok(())
 }
 
-/// 准备账号注入：优先同步本地 auth.json，再在必要时刷新 Token 并写回存储
-pub async fn prepare_account_for_injection_from_auth_dir(
+pub fn write_account_bundle_to_dir(base_dir: &Path, account: &CodexAccount) -> Result<(), String> {
+    let account = resolve_account_for_bundle_write(base_dir, account)?;
+    write_prepared_account_bundle_to_dir(base_dir, &account)
+}
+
+fn managed_projection_dirs_for_account(account_id: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let index = load_account_index();
+    if index.current_account_id.as_deref() == Some(account_id) {
+        dirs.push(get_codex_home());
+    }
+
+    match crate::modules::codex_instance::load_instance_store() {
+        Ok(store) => {
+            if store.default_settings.bind_account_id.as_deref() == Some(account_id) {
+                if let Ok(default_home) = crate::modules::codex_instance::get_default_codex_home() {
+                    dirs.push(default_home);
+                }
+            }
+            for instance in store.instances {
+                if instance.bind_account_id.as_deref() == Some(account_id) {
+                    dirs.push(PathBuf::from(instance.user_data_dir));
+                }
+            }
+        }
+        Err(err) => {
+            logger::log_warn(&format!(
+                "读取 Codex 实例绑定失败，跳过投影写穿: account_id={}, error={}",
+                account_id, err
+            ));
+        }
+    }
+
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.to_string_lossy().to_string()));
+    dirs
+}
+
+fn write_managed_account_projections(account: &CodexAccount) {
+    for dir in managed_projection_dirs_for_account(&account.id) {
+        if let Err(err) = write_prepared_account_bundle_to_dir(&dir, account) {
+            logger::log_warn(&format!(
+                "Codex Token 写穿受管投影失败: account_id={}, target_dir={}, error={}",
+                account.id,
+                dir.display(),
+                err
+            ));
+        }
+    }
+}
+
+pub fn is_managed_auth_refresh_due(account: &CodexAccount) -> bool {
+    if account.is_api_key_auth() || account.requires_reauth {
+        return false;
+    }
+
+    if codex_oauth::is_token_expired(&account.tokens.access_token) {
+        return true;
+    }
+
+    account
+        .token_updated_at
+        .map(|updated_at| updated_at <= now_timestamp() - CODEX_PROACTIVE_REFRESH_INTERVAL_SECONDS)
+        .unwrap_or(true)
+}
+
+async fn perform_managed_token_refresh(
+    mut account: CodexAccount,
+    reason: &str,
+) -> Result<CodexAccount, String> {
+    let refresh_token = match account
+        .tokens
+        .refresh_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+    {
+        Some(token) => token,
+        None => {
+            let reason = "Codex 登录授权缺少 refresh_token，无法自动刷新。请重新登录 Codex 账号。"
+                .to_string();
+            let _ = mark_account_requires_reauth(&mut account, &reason);
+            return Err(reason);
+        }
+    };
+
+    logger::log_info(&format!(
+        "Codex Token Authority 开始刷新: account_id={}, email={}, reason={}",
+        account.id, account.email, reason
+    ));
+
+    match codex_oauth::refresh_access_token_with_fallback(
+        &refresh_token,
+        Some(account.tokens.id_token.as_str()),
+    )
+    .await
+    {
+        Ok(new_tokens) => {
+            account.tokens = new_tokens;
+            sync_identity_from_tokens(&mut account);
+            mark_token_chain_updated(&mut account);
+            save_account(&account)?;
+            write_managed_account_projections(&account);
+            logger::log_info(&format!(
+                "Codex Token Authority 刷新成功: account_id={}, generation={}",
+                account.id, account.token_generation
+            ));
+            Ok(account)
+        }
+        Err(err) => {
+            let user_error = format_refresh_error_for_user(&err);
+            if is_reauth_required_refresh_error(&err) {
+                let _ = mark_account_requires_reauth(&mut account, &user_error);
+                return Err(user_error);
+            }
+            Err(user_error)
+        }
+    }
+}
+
+async fn refresh_managed_account_locked(
     account_id: &str,
-    auth_dir: Option<&Path>,
+    force: bool,
+    reason: &str,
 ) -> Result<CodexAccount, String> {
     let mut account =
         load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
     if account.is_api_key_auth() {
         return Ok(account);
     }
+    if let Err(err) = sync_account_from_authority_sources(&mut account) {
+        logger::log_warn(&format!(
+            "Codex 账号刷新前同步官方凭证失败，继续使用账号库: account_id={}, error={}",
+            account.id, err
+        ));
+    }
+    if account.requires_reauth {
+        return Err(account
+            .reauth_reason
+            .clone()
+            .unwrap_or_else(|| "账号需要重新登录".to_string()));
+    }
+    if !force && !codex_oauth::is_token_expired(&account.tokens.access_token) {
+        return Ok(account);
+    }
 
-    let mut matched_auth_dir: Option<PathBuf> = None;
+    perform_managed_token_refresh(account, reason).await
+}
 
+pub async fn ensure_managed_account_fresh(account_id: &str) -> Result<CodexAccount, String> {
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    refresh_managed_account_locked(account_id, false, "prepare").await
+}
+
+pub async fn force_refresh_managed_account(
+    account_id: &str,
+    reason: &str,
+) -> Result<CodexAccount, String> {
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    refresh_managed_account_locked(account_id, true, reason).await
+}
+
+pub async fn keepalive_managed_account(
+    account_id: &str,
+    reason: &str,
+) -> Result<CodexAccount, String> {
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    let mut account =
+        load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
+    if account.is_api_key_auth() {
+        return Ok(account);
+    }
+    if let Err(err) = sync_account_from_authority_sources(&mut account) {
+        logger::log_warn(&format!(
+            "Codex 保活同步官方凭证失败，继续使用账号库: account_id={}, error={}",
+            account.id, err
+        ));
+    }
+    if account.requires_reauth {
+        return Err(account
+            .reauth_reason
+            .clone()
+            .unwrap_or_else(|| "账号需要重新登录".to_string()));
+    }
+    if !is_managed_auth_refresh_due(&account) {
+        return Ok(account);
+    }
+
+    perform_managed_token_refresh(account, reason).await
+}
+
+pub async fn execute_with_managed_account_projection<R, F>(
+    account_id: &str,
+    auth_dir: &Path,
+    reason: &str,
+    operation: F,
+) -> Result<(CodexAccount, R, Option<String>), String>
+where
+    F: FnOnce(&CodexAccount) -> R,
+{
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    let account = refresh_managed_account_locked(account_id, false, reason).await?;
+    write_prepared_account_bundle_to_dir(auth_dir, &account)?;
+
+    let result = operation(&account);
+    let sync_error = match sync_managed_projection_from_auth_dir(account_id, auth_dir) {
+        Ok(_) => None,
+        Err(err) => Some(err),
+    };
+    let latest_account = load_account(account_id).unwrap_or(account);
+
+    Ok((latest_account, result, sync_error))
+}
+
+/// 准备账号注入：刷新前会先采用更新的官方凭证，随后由账号中心写穿受管投影。
+pub async fn prepare_account_for_injection_from_auth_dir(
+    account_id: &str,
+    auth_dir: Option<&Path>,
+) -> Result<CodexAccount, String> {
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    let account = refresh_managed_account_locked(account_id, false, "prepare").await?;
     if let Some(dir) = auth_dir {
-        if sync_account_from_auth_dir_if_current(&mut account, dir)? {
-            matched_auth_dir = Some(dir.to_path_buf());
-        }
-    }
-
-    if matched_auth_dir.is_none() {
-        let default_home = get_codex_home();
-        if sync_account_from_auth_dir_if_current(&mut account, &default_home)? {
-            matched_auth_dir = Some(default_home);
-        }
-    }
-
-    if codex_oauth::is_token_expired(&account.tokens.access_token) {
-        logger::log_info(&format!("账号 {} 的 Token 已过期，尝试刷新", account.email));
-        if let Some(ref refresh_token) = account.tokens.refresh_token {
-            match codex_oauth::refresh_access_token_with_fallback(
-                refresh_token,
-                Some(account.tokens.id_token.as_str()),
-            )
-            .await
-            {
-                Ok(new_tokens) => {
-                    logger::log_info(&format!("账号 {} 的 Token 刷新成功", account.email));
-                    account.tokens = new_tokens;
-                    save_account(&account)?;
-                    if let Some(dir) = matched_auth_dir.as_deref() {
-                        if let Err(err) = write_account_bundle_to_dir(dir, &account) {
-                            logger::log_warn(&format!(
-                                "Codex 账号刷新后回写本地 auth.json 失败: account_id={}, target_dir={}, error={}",
-                                account.id,
-                                dir.display(),
-                                err
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    logger::log_error(&format!("账号 {} Token 刷新失败: {}", account.email, e));
-                    return Err(format!("Token 已过期且刷新失败: {}", e));
-                }
-            }
-        } else {
-            return Err("Token 已过期且无 refresh_token，请重新登录".to_string());
-        }
+        write_prepared_account_bundle_to_dir(dir, &account)?;
     }
     Ok(account)
 }
@@ -2181,56 +3085,27 @@ pub async fn prepare_account_for_injection(account_id: &str) -> Result<CodexAcco
     prepare_account_for_injection_from_store(account_id).await
 }
 
-/// 准备账号注入（存储真源模式）：
-/// 仅使用账号中心存储作为 Token 真源，不从受管目录/本地 auth.json 回读，避免旧快照反向覆盖。
+/// 准备账号注入（账号中心模式）：
+/// 账号中心负责最终写穿；刷新前只接受带有更新 last_refresh 或未过期访问令牌的官方凭证。
 pub async fn prepare_account_for_injection_from_store(
     account_id: &str,
 ) -> Result<CodexAccount, String> {
-    let mut account =
-        load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
-    if account.is_api_key_auth() {
-        return Ok(account);
-    }
-
-    if codex_oauth::is_token_expired(&account.tokens.access_token) {
-        logger::log_info(&format!("账号 {} 的 Token 已过期，尝试刷新", account.email));
-        if let Some(ref refresh_token) = account.tokens.refresh_token {
-            match codex_oauth::refresh_access_token_with_fallback(
-                refresh_token,
-                Some(account.tokens.id_token.as_str()),
-            )
-            .await
-            {
-                Ok(new_tokens) => {
-                    logger::log_info(&format!("账号 {} 的 Token 刷新成功", account.email));
-                    account.tokens = new_tokens;
-                    save_account(&account)?;
-                }
-                Err(e) => {
-                    logger::log_error(&format!("账号 {} Token 刷新失败: {}", account.email, e));
-                    return Err(format!("Token 已过期且刷新失败: {}", e));
-                }
-            }
-        } else {
-            return Err("Token 已过期且无 refresh_token，请重新登录".to_string());
-        }
-    }
-
-    Ok(account)
+    ensure_managed_account_fresh(account_id).await
 }
 
-/// 切换账号（写入 auth.json）
-pub fn switch_account(account_id: &str) -> Result<CodexAccount, String> {
-    let account = load_account(account_id).ok_or_else(|| format!("账号不存在: {}", account_id))?;
+fn switch_account_with_prepared(
+    account_id: &str,
+    account_for_write: CodexAccount,
+) -> Result<CodexAccount, String> {
     let codex_home = get_codex_home();
     let auth_path = codex_home.join("auth.json");
     logger::log_info(&format!(
         "[Codex切号] 开始切换账号: account_id={}, email={}, target_dir={}",
-        account.id,
-        account.email,
+        account_for_write.id,
+        account_for_write.email,
         codex_home.display()
     ));
-    write_account_bundle_to_dir(&codex_home, &account)?;
+    write_prepared_account_bundle_to_dir(&codex_home, &account_for_write)?;
     logger::log_info(&format!(
         "[Codex切号] 已替换目录登录信息: target_dir={}, target_file={}",
         codex_home.display(),
@@ -2243,13 +3118,20 @@ pub fn switch_account(account_id: &str) -> Result<CodexAccount, String> {
     save_account_index(&index)?;
 
     // 更新账号的 last_used
-    let mut updated_account = account.clone();
+    let mut updated_account = account_for_write.clone();
     updated_account.update_last_used();
     save_account(&updated_account)?;
 
-    logger::log_info(&format!("已切换到 Codex 账号: {}", account.email));
+    logger::log_info(&format!("已切换到 Codex 账号: {}", updated_account.email));
 
     Ok(updated_account)
+}
+
+pub async fn switch_account_managed(account_id: &str) -> Result<CodexAccount, String> {
+    let lock = codex_token_lock_for(account_id);
+    let _guard = lock.lock().await;
+    let account = refresh_managed_account_locked(account_id, false, "switch").await?;
+    switch_account_with_prepared(account_id, account)
 }
 
 /// 从本地 auth.json 导入账号
@@ -2331,6 +3213,84 @@ fn import_account_struct(account: CodexAccount) -> Result<CodexAccount, String> 
     Ok(imported)
 }
 
+fn import_account_from_json_value(
+    value: serde_json::Value,
+) -> Result<Option<CodexAccount>, String> {
+    if is_auth_mode_apikey(
+        value
+            .get("auth_mode")
+            .and_then(|value| value.as_str())
+            .or_else(|| value.get("authMode").and_then(|value| value.as_str())),
+    ) {
+        if let Some(api_key) = value
+            .get("OPENAI_API_KEY")
+            .and_then(|value| value.as_str())
+            .and_then(normalize_api_key)
+        {
+            return Ok(Some(upsert_api_key_account(
+                api_key,
+                extract_api_base_url_from_json_value(&value),
+                None,
+                value
+                    .get("api_provider_id")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+                value
+                    .get("api_provider_name")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string()),
+            )?));
+        }
+    }
+
+    if let Some((tokens, account_id_hint)) = extract_codex_tokens_from_value(&value) {
+        return Ok(Some(upsert_account_with_hints(
+            tokens,
+            account_id_hint,
+            None,
+        )?));
+    }
+
+    if let Ok(account) = serde_json::from_value::<CodexAccount>(value) {
+        return Ok(Some(import_account_struct(account)?));
+    }
+
+    Ok(None)
+}
+
+fn parse_line_delimited_json_values(
+    json_content: &str,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    let lines: Vec<(usize, &str)> = json_content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some((index + 1, trimmed))
+            }
+        })
+        .collect();
+
+    if lines.len() <= 1 {
+        return Ok(None);
+    }
+
+    let mut values = Vec::with_capacity(lines.len());
+    for (line_number, line) in lines {
+        let parsed = serde_json::from_str::<serde_json::Value>(line)
+            .map_err(|e| format!("第 {} 行不是有效 JSON: {}", line_number, e))?;
+        if !parsed.is_object() {
+            return Err(format!("第 {} 行不是 JSON 对象", line_number));
+        }
+        values.push(parsed);
+    }
+
+    Ok(Some(values))
+}
+
 /// 从 JSON 字符串导入账号
 pub fn import_from_json(json_content: &str) -> Result<Vec<CodexAccount>, String> {
     ensure_storage_writable_for_import()?;
@@ -2381,80 +3341,16 @@ pub fn import_from_json(json_content: &str) -> Result<Vec<CodexAccount>, String>
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_content) {
         match parsed {
             serde_json::Value::Object(_) => {
-                if is_auth_mode_apikey(
-                    parsed
-                        .get("auth_mode")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| parsed.get("authMode").and_then(|value| value.as_str())),
-                ) {
-                    if let Some(api_key) = parsed
-                        .get("OPENAI_API_KEY")
-                        .and_then(|value| value.as_str())
-                        .and_then(normalize_api_key)
-                    {
-                        return Ok(vec![upsert_api_key_account(
-                            api_key,
-                            extract_api_base_url_from_json_value(&parsed),
-                            None,
-                            parsed
-                                .get("api_provider_id")
-                                .and_then(|value| value.as_str())
-                                .map(|value| value.to_string()),
-                            parsed
-                                .get("api_provider_name")
-                                .and_then(|value| value.as_str())
-                                .map(|value| value.to_string()),
-                        )?]);
-                    }
-                }
-
-                if let Some((tokens, account_id_hint)) = extract_codex_tokens_from_value(&parsed) {
-                    let account = upsert_account_with_hints(tokens, account_id_hint, None)?;
+                if let Some(account) = import_account_from_json_value(parsed)? {
                     return Ok(vec![account]);
-                }
-
-                if let Ok(account) = serde_json::from_value::<CodexAccount>(parsed) {
-                    let imported = import_account_struct(account)?;
-                    return Ok(vec![imported]);
                 }
             }
             serde_json::Value::Array(items) => {
                 let mut result = Vec::new();
 
                 for item in items {
-                    if let Some((tokens, account_id_hint)) = extract_codex_tokens_from_value(&item)
-                    {
-                        result.push(upsert_account_with_hints(tokens, account_id_hint, None)?);
-                        continue;
-                    }
-
-                    if is_auth_mode_apikey(
-                        item.get("auth_mode")
-                            .and_then(|value| value.as_str())
-                            .or_else(|| item.get("authMode").and_then(|value| value.as_str())),
-                    ) {
-                        if let Some(api_key) = item
-                            .get("OPENAI_API_KEY")
-                            .and_then(|value| value.as_str())
-                            .and_then(normalize_api_key)
-                        {
-                            result.push(upsert_api_key_account(
-                                api_key,
-                                extract_api_base_url_from_json_value(&item),
-                                None,
-                                item.get("api_provider_id")
-                                    .and_then(|value| value.as_str())
-                                    .map(|value| value.to_string()),
-                                item.get("api_provider_name")
-                                    .and_then(|value| value.as_str())
-                                    .map(|value| value.to_string()),
-                            )?);
-                            continue;
-                        }
-                    }
-
-                    if let Ok(account) = serde_json::from_value::<CodexAccount>(item) {
-                        result.push(import_account_struct(account)?);
+                    if let Some(account) = import_account_from_json_value(item)? {
+                        result.push(account);
                     }
                 }
 
@@ -2466,14 +3362,19 @@ pub fn import_from_json(json_content: &str) -> Result<Vec<CodexAccount>, String>
         }
     }
 
-    // 尝试解析为账号数组
-    if let Ok(accounts) = serde_json::from_str::<Vec<CodexAccount>>(json_content) {
+    if let Some(items) = parse_line_delimited_json_values(json_content)? {
         let mut result = Vec::new();
-        for acc in accounts {
-            let imported = import_account_struct(acc)?;
-            result.push(imported);
+
+        for (index, item) in items.into_iter().enumerate() {
+            match import_account_from_json_value(item)? {
+                Some(account) => result.push(account),
+                None => return Err(format!("第 {} 行未找到有效的 Codex Token", index + 1)),
+            }
         }
-        return Ok(result);
+
+        if !result.is_empty() {
+            return Ok(result);
+        }
     }
 
     Err("无法解析 JSON 内容".to_string())
@@ -2610,14 +3511,17 @@ fn extract_codex_tokens_from_value(
 mod tests {
     use super::{
         build_account_storage_id, detect_auth_file_plan_type_from_path,
-        extract_codex_tokens_from_value, get_accounts_dir, get_accounts_storage_path,
-        get_current_account, list_accounts_checked, load_account, load_account_index,
-        read_api_provider_from_config_toml, read_quick_config_from_config_toml,
-        resolve_api_provider_config, save_account, save_account_index, sync_account_from_auth_dir,
-        validate_api_key_credentials, write_api_provider_to_config_toml,
+        extract_codex_tokens_from_value, extract_user_info, format_refresh_error_for_user,
+        get_accounts_dir, get_accounts_storage_path, get_current_account, list_accounts_checked,
+        load_account, load_account_index, parse_auth_file_last_refresh, parse_codex_account_compat,
+        parse_line_delimited_json_values, read_api_provider_from_config_toml,
+        read_quick_config_from_config_toml, resolve_api_provider_config, save_account,
+        save_account_index, should_accept_authority_snapshot, sync_account_from_auth_dir,
+        sync_managed_projection_from_auth_dir, validate_api_key_credentials,
+        write_api_provider_to_config_toml, write_managed_projection_to_dir,
         write_quick_config_to_config_toml, ApiProviderConfig, CodexAccountIndex,
-        CodexAccountSummary, CodexAuthFile, CodexAuthTokens, CODEX_AUTO_COMPACT_DEFAULT_LIMIT,
-        CODEX_CONTEXT_WINDOW_1M_VALUE,
+        CodexAccountSummary, CodexAuthFile, CodexAuthTokens, LocalCodexOAuthSnapshot,
+        CODEX_AUTO_COMPACT_DEFAULT_LIMIT, CODEX_CONTEXT_WINDOW_1M_VALUE,
     };
     use crate::models::codex::{CodexAccount, CodexApiProviderMode, CodexTokens};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -2626,6 +3530,103 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn parse_line_delimited_json_values_accepts_one_object_per_line() {
+        let raw = r#"{"id_token":"id-1","access_token":"access-1"}
+{"id_token":"id-2","access_token":"access-2"}"#;
+
+        let values = parse_line_delimited_json_values(raw)
+            .expect("json lines should parse")
+            .expect("multiple non-empty lines should return values");
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values[0].get("id_token").and_then(|value| value.as_str()),
+            Some("id-1")
+        );
+        assert_eq!(
+            values[1]
+                .get("access_token")
+                .and_then(|value| value.as_str()),
+            Some("access-2")
+        );
+    }
+
+    #[test]
+    fn compat_parses_portable_codex_token_account() {
+        let id_token = make_jwt(serde_json::json!({
+            "email": "portable@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": "user-portable",
+                "chatgpt_plan_type": "plus",
+                "account_id": "acc-portable"
+            }
+        }));
+        let summary = CodexAccountSummary {
+            id: "stored-portable".to_string(),
+            email: "summary@example.com".to_string(),
+            plan_type: None,
+            subscription_active_until: None,
+            created_at: 100,
+            last_used: 200,
+        };
+        let account = parse_codex_account_compat(
+            serde_json::json!({
+                "id_token": id_token,
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "last_refresh": 300,
+                "type": "codex"
+            }),
+            "stored-portable",
+            Some(&summary),
+        )
+        .expect("compat parse")
+        .expect("account");
+
+        assert_eq!(account.id, "stored-portable");
+        assert_eq!(account.email, "portable@example.com");
+        assert_eq!(account.user_id.as_deref(), Some("user-portable"));
+        assert_eq!(account.plan_type.as_deref(), Some("plus"));
+        assert_eq!(account.account_id.as_deref(), Some("acc-portable"));
+        assert_eq!(account.created_at, 100);
+        assert_eq!(account.last_used, 200);
+        assert_eq!(account.token_updated_at, Some(300));
+    }
+
+    #[test]
+    fn compat_parses_portable_codex_api_key_account() {
+        let account = parse_codex_account_compat(
+            serde_json::json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-test-portable",
+                "api_base_url": "https://example.com/v1",
+                "api_provider_id": "custom-openai",
+                "api_provider_name": "Custom OpenAI",
+                "email": "api@example.com",
+                "created_at": 100,
+                "last_used": 200
+            }),
+            "stored-apikey",
+            None,
+        )
+        .expect("compat parse")
+        .expect("account");
+
+        assert_eq!(account.id, "stored-apikey");
+        assert!(account.is_api_key_auth());
+        assert_eq!(account.email, "api@example.com");
+        assert_eq!(account.openai_api_key.as_deref(), Some("sk-test-portable"));
+        assert_eq!(
+            account.api_base_url.as_deref(),
+            Some("https://example.com/v1")
+        );
+        assert_eq!(account.api_provider_id.as_deref(), Some("custom-openai"));
+        assert_eq!(account.api_provider_name.as_deref(), Some("Custom OpenAI"));
+        assert_eq!(account.created_at, 100);
+        assert_eq!(account.last_used, 200);
+    }
 
     fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -2745,6 +3746,7 @@ mod tests {
             id: storage_id,
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_active_until: account.subscription_active_until.clone(),
             created_at: account.created_at,
             last_used: account.last_used,
         });
@@ -2819,6 +3821,102 @@ mod tests {
     }
 
     #[test]
+    fn extracts_email_from_openai_profile_claim() {
+        let id_token = make_jwt(serde_json::json!({
+            "aud": ["https://api.openai.com/v1"],
+            "iss": "https://auth.openai.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_user_id": "user-profile",
+                "chatgpt_plan_type": "plus",
+                "account_id": "acc-profile"
+            },
+            "https://api.openai.com/profile": {
+                "email": "profile@example.com",
+                "email_verified": true
+            }
+        }));
+
+        let (email, user_id, plan_type, _, account_id, _) =
+            extract_user_info(&id_token).expect("extract profile email");
+
+        assert_eq!(email, "profile@example.com");
+        assert_eq!(user_id.as_deref(), Some("user-profile"));
+        assert_eq!(plan_type.as_deref(), Some("plus"));
+        assert_eq!(account_id.as_deref(), Some("acc-profile"));
+    }
+
+    #[test]
+    fn parses_auth_file_last_refresh_variants() {
+        assert_eq!(
+            parse_auth_file_last_refresh(Some(&serde_json::json!("2026-04-13T00:00:00.000000Z"))),
+            Some(1_776_038_400)
+        );
+        assert_eq!(
+            parse_auth_file_last_refresh(Some(&serde_json::json!(1_765_497_600_123i64))),
+            Some(1_765_497_600)
+        );
+        assert_eq!(
+            parse_auth_file_last_refresh(Some(&serde_json::json!(1_765_497_600i64))),
+            Some(1_765_497_600)
+        );
+    }
+
+    #[test]
+    fn formats_refresh_errors_with_actionable_reason() {
+        let reused = format_refresh_error_for_user(
+            "Token 刷新失败: status=401 Unauthorized, error_code=refresh_token_reused",
+        );
+        assert!(reused.contains("refresh_token 已被其它客户端或实例使用过"));
+        assert!(reused.contains("请重新登录"));
+
+        let region = format_refresh_error_for_user(
+            "Token 刷新失败: status=403 Forbidden, error_code=unsupported_country_region_territory",
+        );
+        assert!(region.contains("当前网络地区不支持刷新 Codex 授权"));
+        assert!(!region.contains("请重新登录"));
+    }
+
+    #[test]
+    fn authority_snapshot_requires_newer_refresh_marker() {
+        let mut account = CodexAccount::new(
+            "codex_test".to_string(),
+            "demo@example.com".to_string(),
+            make_codex_tokens(
+                "demo@example.com",
+                "acc-current",
+                "org-current",
+                "old",
+                "rt-old",
+            ),
+        );
+        account.account_id = Some("acc-current".to_string());
+        account.organization_id = Some("org-current".to_string());
+        account.token_updated_at = Some(2000);
+
+        let snapshot = LocalCodexOAuthSnapshot {
+            tokens: make_codex_tokens(
+                "demo@example.com",
+                "acc-current",
+                "org-current",
+                "new",
+                "rt-new",
+            ),
+            email: "demo@example.com".to_string(),
+            subscription_active_until: None,
+            account_id: Some("acc-current".to_string()),
+            organization_id: Some("org-current".to_string()),
+            last_refresh_at: Some(1000),
+        };
+        assert!(!should_accept_authority_snapshot(&account, &snapshot));
+
+        let newer_snapshot = LocalCodexOAuthSnapshot {
+            last_refresh_at: Some(3000),
+            ..snapshot
+        };
+        assert!(should_accept_authority_snapshot(&account, &newer_snapshot));
+    }
+
+    #[test]
     fn detect_auth_file_plan_type_from_filename() {
         let prolite = detect_auth_file_plan_type_from_path(std::path::Path::new(
             "/tmp/codex-demo@example.com-prolite.json",
@@ -2835,7 +3933,7 @@ mod tests {
     }
 
     #[test]
-    fn current_account_prefers_stored_tokens_over_local_auth_json() {
+    fn current_account_does_not_sync_tokens_from_official_store() {
         let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let env = TestEnvGuard::new("codex-current-account-sync-test");
 
@@ -2906,6 +4004,41 @@ mod tests {
             persisted.tokens.refresh_token.as_deref(),
             latest_tokens.refresh_token.as_deref()
         );
+    }
+
+    #[test]
+    fn managed_projection_sync_requires_projection_marker() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let env = TestEnvGuard::new("codex-managed-projection-sync-test");
+
+        let stored = seed_oauth_account(make_codex_tokens(
+            "demo@example.com",
+            "acc-current",
+            "org-current",
+            "seed",
+            "rt-seed",
+        ));
+        let managed_home = env.home_dir.join("managed-homes").join(&stored.id);
+        write_oauth_auth_file(&managed_home, &stored.tokens, "acc-current");
+        write_managed_projection_to_dir(&managed_home, &stored).expect("write managed projection");
+
+        let latest_tokens = make_codex_tokens(
+            "demo@example.com",
+            "acc-current",
+            "org-current",
+            "managed",
+            "rt-managed",
+        );
+        write_oauth_auth_file(&managed_home, &latest_tokens, "acc-current");
+
+        let synced = sync_managed_projection_from_auth_dir(&stored.id, &managed_home)
+            .expect("sync managed projection");
+        assert_eq!(synced.tokens.access_token, latest_tokens.access_token);
+        assert_eq!(
+            synced.tokens.refresh_token.as_deref(),
+            latest_tokens.refresh_token.as_deref()
+        );
+        assert!(synced.token_generation > stored.token_generation);
     }
 
     #[test]
@@ -3373,6 +4506,7 @@ pub fn update_api_key_credentials(
             summary.id = account.id.clone();
             summary.email = account.email.clone();
             summary.plan_type = account.plan_type.clone();
+            summary.subscription_active_until = account.subscription_active_until.clone();
             summary.last_used = account.last_used;
             summary_found = true;
             break;
@@ -3384,6 +4518,7 @@ pub fn update_api_key_credentials(
             id: account.id.clone(),
             email: account.email.clone(),
             plan_type: account.plan_type.clone(),
+            subscription_active_until: account.subscription_active_until.clone(),
             created_at: account.created_at,
             last_used: account.last_used,
         });
@@ -3407,13 +4542,7 @@ pub fn update_api_key_credentials(
 
     if was_current {
         let codex_home = get_codex_home();
-        write_auth_file_to_dir(&codex_home, &account)?;
-        if let Err(err) = write_codex_keychain_to_dir(&codex_home, &account) {
-            logger::log_warn(&format!(
-                "Codex API Key 账号编辑后写入 keychain 失败: {}",
-                err
-            ));
-        }
+        write_account_bundle_to_dir(&codex_home, &account)?;
     }
 
     logger::log_info(&format!(
